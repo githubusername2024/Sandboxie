@@ -120,6 +120,7 @@ private slots:
 	void OnFilterTemplates()		{ LoadTemplates(); }
 	void OnAddTemplates();
 	void OnTemplateWizard();
+	void OnOpenTemplate();
 	void OnDelTemplates();
 
 	void SetIniEdit(bool bEnable);
@@ -130,6 +131,7 @@ private slots:
 
 
 	void CertChanged();
+	void KeyChanged();
 	void UpdateCert();
 	void OnGetCert();
 	void OnCertData(const QByteArray& Certificate, const QVariantMap& Params);

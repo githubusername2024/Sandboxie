@@ -225,8 +225,9 @@ COptionsWindow::COptionsWindow(const QSharedPointer<CSbieIni>& pBox, const QStri
 	ui.tabsStop->setTabIcon(2, CSandMan::GetIcon("Policy"));
 		
 	ui.tabsInternet->setCurrentIndex(0);
-	ui.tabsInternet->setTabIcon(0, CSandMan::GetIcon("Program"));
+	ui.tabsInternet->setTabIcon(0, CSandMan::GetIcon("EthSocket2"));
 	ui.tabsInternet->setTabIcon(1, CSandMan::GetIcon("Wall"));
+	ui.tabsInternet->setTabIcon(2, CSandMan::GetIcon("Network3"));
 
 	ui.tabsAccess->setCurrentIndex(0);
 	ui.tabsAccess->setTabIcon(0, CSandMan::GetIcon("Folder"));
@@ -373,6 +374,8 @@ COptionsWindow::COptionsWindow(const QSharedPointer<CSbieIni>& pBox, const QStri
 	AddIconToLabel(ui.lblOther, CSandMan::GetIcon("NoAccess").pixmap(size,size));
 
 	AddIconToLabel(ui.lblStopOpt, CSandMan::GetIcon("Stop").pixmap(size,size));
+
+	AddIconToLabel(ui.lblPorts, CSandMan::GetIcon("Port").pixmap(size,size));
 
 	AddIconToLabel(ui.lblMode, CSandMan::GetIcon("Anon").pixmap(size,size));
 	AddIconToLabel(ui.lblPolicy, CSandMan::GetIcon("Policy").pixmap(size,size));
@@ -540,6 +543,7 @@ COptionsWindow::COptionsWindow(const QSharedPointer<CSbieIni>& pBox, const QStri
 		pTmplBtnMenu->addAction(tr("Add %1 Template").arg(CTemplateWizard::GetTemplateLabel((CTemplateWizard::ETemplateType)i)), this, SLOT(OnTemplateWizard()))->setData(i);
 	ui.btnAddTemplate->setPopupMode(QToolButton::MenuButtonPopup);
 	ui.btnAddTemplate->setMenu(pTmplBtnMenu);
+	connect(ui.btnOpenTemplate, SIGNAL(clicked(bool)), this, SLOT(OnOpenTemplate()));
 	connect(ui.btnDelTemplate, SIGNAL(clicked(bool)), this, SLOT(OnDelTemplates()));
 	connect(ui.chkScreenReaders, SIGNAL(clicked(bool)), this, SLOT(OnScreenReaders()));
 	//
@@ -1077,7 +1081,7 @@ void COptionsWindow::showTab(const QString& Name)
 	else
 		m_pStack->setCurrentWidget(pWidget);
 
-	SafeShow(this);
+	CSandMan::SafeShow(this);
 }
 
 void COptionsWindow::SetProgramItem(QString Program, QTreeWidgetItem* pItem, int Column, const QString& Suffix, bool bList)
@@ -1174,7 +1178,7 @@ void COptionsWindow::UpdateCurrentTab()
 
 		OnRestrictStart();
 	}
-	else if (m_pCurrentTab == ui.tabInternet || m_pCurrentTab == ui.tabINet)
+	else if (m_pCurrentTab == ui.tabInternet || m_pCurrentTab == ui.tabINet || m_pCurrentTab == ui.tabNetConfig)
 	{
 		LoadBlockINet();
 	}

@@ -5,12 +5,59 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 
 
+## [1.13.6 / 5.68.6] - 2024-04-21
 
-## [1.13.5 / 5.68.5] - 2024-03-??
+### Added
+- added "BlockInterferenceControl=y" option to prevent sandboxed processes from forcing windows on top and moving the mounse pointer (thanks Yeyixiao)
+  - Note: this option may cause issues in games hence do not enable it for gaming boxes.
+- added support for hard links [#3826](https://github.com/sandboxie-plus/Sandboxie/issues/3826)
+- added mechanism to terminate stuck sandboxed processes from the driver
+- added Make the trigger list editable [#3742](https://github.com/sandboxie-plus/Sandboxie/issues/3742)
+- added Optionally extend the screenshot protection to the UI [#3739](https://github.com/sandboxie-plus/Sandboxie/issues/3739)
+- added a button to edit local/custom templates [#3738](https://github.com/sandboxie-plus/Sandboxie/issues/3738)
+- added Permanently Re-sizable or Larger "Run Sandboxed" Window [#3697](https://github.com/sandboxie-plus/Sandboxie/issues/3697)
+- added Notepad++ template [#3836](https://github.com/sandboxie-plus/Sandboxie/pull/3836)
 
 ### Changed
-- on systems in test signing mode sandboxie will by default try outdated offsets
+- improved Avast template [#3777](https://github.com/sandboxie-plus/Sandboxie/pull/3777)
+- renamed a bunch of experimental options and marked them as experimental in the UI
+  - "IsBlockCapture=y" -> "BlockScreenCapture=y"
+  - "IsProtectScreen=>" -> "CoverBoxedWindows=y"
+
+### Fixed
+- fixed When I change the BlockDNS and BlockPorts options, the Apply button is not activated [#3807](https://github.com/sandboxie-plus/Sandboxie/issues/3807)
+- fixed troubleshooting wizard broke with new Qt [#3810](https://github.com/sandboxie-plus/Sandboxie/discussions/3810)
+- fixed Settings dialog now showing the right ram disk letter
+- fixed issues with updater broke with new Qt due to missing SSL support [3810](https://github.com/sandboxie-plus/Sandboxie/discussions/3810)
+- fixed Enabling "DropAdminRights/FakeAdminRights" adds "BlockInterferePower and ForceProtectionOnMount" to the INI [#3825](https://github.com/sandboxie-plus/Sandboxie/issues/3825)
+- fixed KeePass "Out of Memory" crash due to "BlockScreenCapture=y" [#3768](https://github.com/sandboxie-plus/Sandboxie/issues/3768)
+- fixed Sandboxie 1.13.4 with IsBlockCapture=y not working on Windows 7 [#3769](https://github.com/sandboxie-plus/Sandboxie/issues/3769)
+- fixed explorer.exe issue "FakeAdminRights=y" [#3638](https://github.com/sandboxie-plus/Sandboxie/issues/3638)
+- fixed Make it possible to disable forced folder warning [#3569](https://github.com/sandboxie-plus/Sandboxie/issues/3569)
+
+
+
+## [1.13.5 / 5.68.5] - 2024-04-10
+
+### Added
+- added Setting all processes per box to a certain core [#3276](https://github.com/sandboxie-plus/Sandboxie/issues/3276)
+  - set "CpuAffinityMask=0x00000001" in Sandboxie.ini, where 0x00000001 is a bit mask indicating which cores are to be used
+  - only supports cores 0-31, for 32+ will be always disabled when this option is used
+- added checkbox for Samba and DNS port blocking
+- added Weasel template [#3806](https://github.com/sandboxie-plus/Sandboxie/pull/3806) (thanks xWTF)
+
+### Changed
+- on systems in test signing mode, Sandboxie will try outdated offsets by default
 - changed Qt5 version to Qt5.15.13 with latest security patches [#3694](https://github.com/sandboxie-plus/Sandboxie/pull/3694) (thanks LumitoLuma)
+- moved network restrictions from general restrictions tab to an own tab on the network page
+- improved certificate retrieval UI messages
+- improved MPC-BE template [#3798](https://github.com/sandboxie-plus/Sandboxie/pull/3798)
+
+### Fixed
+ - fixed Virtualization scheme Version 2 causing extremely slow file deleting speed [#3650](https://github.com/sandboxie-plus/Sandboxie/issues/3650)
+
+### Removed
+- removed obsolete recommendations in Templates.ini [#3802](https://github.com/sandboxie-plus/Sandboxie/pull/3802)
 
 
 
