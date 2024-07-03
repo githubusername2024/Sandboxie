@@ -1,3 +1,5 @@
+#define SOFTWARE_NAME L"Sandboxie-Plus"
+
 typedef union _SCertInfo {
     unsigned long long State;
     struct {
