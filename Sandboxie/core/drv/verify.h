@@ -4,11 +4,11 @@ typedef union _SCertInfo {
     unsigned long long State;
     struct {
         unsigned long
-            active      : 1,      
-            expired     : 1,      
-            outdated    : 1,      
-            unused_1    : 2,      
-            grace_period: 32,    
+            active      : 1,      // certificate is active
+            expired     : 1,      // certificate is expired but may be active
+            outdated    : 1,      // certificate is expired, not anymore valid for the current build
+            unused_1    : 2,      // DEPRECATED
+            grace_period: 1,     // the certificate is expired and or outdated but we keep it valid for 1 extra month to allow for a seamless renewal
             reservd_2   : 2,
 
             type        : 5,
