@@ -48,48 +48,14 @@ typedef union _SCertInfo {
 } SCertInfo;
 
 enum ECertType {
-    eCertNoType         = 0b00100,
-
-    eCertEternal        = 0b00100,
-    eCertContributor    = 0b00100,
-//  eCert               = 0b00110,
-//  eCert               = 0b00111,
-            
-    eCertBusiness       = 0b00100,
-//  eCert               = 0b01001,
-//  eCert               = 0b01010,
-//  eCert               = 0b01011,
-
-    eCertPersonal       = 0b00100,
-//  eCert               = 0b01101, 
-//  eCert               = 0b01110,
-//  eCert               = 0b01111,
-
-    eCertHome           = 0b00100,
-    eCertFamily         = 0b00100, 
-//  eCert               = 0b10010,
-//  eCert               = 0b10011,
-            
-//  eCertOther          = 0b10100,
-//  eCert               = 0b10101, 
-//  eCert               = 0b10110,
-//  eCert               = 0b10111,
-
-    eCertPatreon        = 0b00100,
-    eCertGreatPatreon   = 0b00100,
-    eCertEntryPatreon   = 0b00100,
-//  eCert               = 0b11011,
-
-    eCertEvaluation     = 0b00100
+    eCertNoType = eCertEternal = eCertContributor = eCertBusiness = eCertPersonal = 
+    eCertHome = eCertFamily = eCertPatreon = eCertGreatPatreon = 
+    eCertEntryPatreon = eCertEvaluation = 0b00100
 };
         
 enum ECertLevel {
-    eCertNoLevel        = 0b111,
-    eCertStandard       = 0b111,
-    eCertStandard2      = 0b111,
-    eCertAdvanced1      = 0b111,
-    eCertAdvanced       = 0b111,
-    eCertMaxLevel       = 0b111,
+    eCertNoLevel = eCertStandard = eCertStandard2 = 
+    eCertAdvanced1 = eCertAdvanced = eCertMaxLevel = 0b111
 };
 
 #define CERT_IS_TYPE(cert,t)        ((cert.type & 0b11100) == (unsigned long)(t))
