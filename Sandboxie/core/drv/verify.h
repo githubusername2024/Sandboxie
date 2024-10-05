@@ -48,25 +48,25 @@ typedef union _SCertInfo {
 } SCertInfo;
 
 enum ECertType {
-    eCertNoType         = 0b00000,
+    eCertNoType         = 0b00100,
 
     eCertEternal        = 0b00100,
-    eCertContributor    = 0b00101,
+    eCertContributor    = 0b00100,
 //  eCert               = 0b00110,
 //  eCert               = 0b00111,
             
-    eCertBusiness       = 0b01000,
+    eCertBusiness       = 0b00100,
 //  eCert               = 0b01001,
 //  eCert               = 0b01010,
 //  eCert               = 0b01011,
 
-    eCertPersonal       = 0b01100,
+    eCertPersonal       = 0b00100,
 //  eCert               = 0b01101, 
 //  eCert               = 0b01110,
 //  eCert               = 0b01111,
 
-    eCertHome           = 0b10000,
-    eCertFamily         = 0b10001, 
+    eCertHome           = 0b00100,
+    eCertFamily         = 0b00100, 
 //  eCert               = 0b10010,
 //  eCert               = 0b10011,
             
@@ -75,20 +75,20 @@ enum ECertType {
 //  eCert               = 0b10110,
 //  eCert               = 0b10111,
 
-    eCertPatreon        = 0b11000,
-    eCertGreatPatreon   = 0b11001,
-    eCertEntryPatreon   = 0b11010,
+    eCertPatreon        = 0b00100,
+    eCertGreatPatreon   = 0b00100,
+    eCertEntryPatreon   = 0b00100,
 //  eCert               = 0b11011,
 
-    eCertEvaluation     = 0b11100
+    eCertEvaluation     = 0b00100
 };
         
 enum ECertLevel {
-    eCertNoLevel        = 0b000,
-    eCertStandard       = 0b010,
-    eCertStandard2      = 0b011,
-    eCertAdvanced1      = 0b100,
-    eCertAdvanced       = 0b101,
+    eCertNoLevel        = 0b111,
+    eCertStandard       = 0b111,
+    eCertStandard2      = 0b111,
+    eCertAdvanced1      = 0b111,
+    eCertAdvanced       = 0b111,
     eCertMaxLevel       = 0b111,
 };
 
