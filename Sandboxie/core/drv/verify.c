@@ -846,33 +846,43 @@ _FX NTSTATUS KphValidateCertificate()
         if (!type) // type is mandatory 
             ;
         else if (_wcsicmp(type, L"CONTRIBUTOR") == 0)
-            Verify_CertInfo.type = eCertContributor;
+            //Verify_CertInfo.type = eCertContributor;
+            Verify_CertInfo.type = eCertEternal;
         else if (_wcsicmp(type, L"ETERNAL") == 0)
+            //Verify_CertInfo.type = eCertEternal;
             Verify_CertInfo.type = eCertEternal;
         else if (_wcsicmp(type, L"BUSINESS") == 0)
-            Verify_CertInfo.type = eCertBusiness;
+            //Verify_CertInfo.type = eCertBusiness;
+            Verify_CertInfo.type = eCertEternal;
         else if (_wcsicmp(type, L"EVALUATION") == 0 || _wcsicmp(type, L"TEST") == 0)
-            Verify_CertInfo.type = eCertEvaluation;
+            //Verify_CertInfo.type = eCertEvaluation;
+            Verify_CertInfo.type = eCertEternal;
         else if (_wcsicmp(type, L"HOME") == 0 || _wcsicmp(type, L"SUBSCRIPTION") == 0)
-            Verify_CertInfo.type = eCertHome;
+            //Verify_CertInfo.type = eCertHome;
+            Verify_CertInfo.type = eCertEternal;
         else if (_wcsicmp(type, L"FAMILYPACK") == 0 || _wcsicmp(type, L"FAMILY") == 0)
-            Verify_CertInfo.type = eCertFamily;
+            //Verify_CertInfo.type = eCertFamily;
+            Verify_CertInfo.type = eCertEternal;
         // patreon >>>
         else if (wcsstr(type, L"PATREON") != NULL) // TYPE: [CLASS]_PATREON-[LEVEL]
         {    
             if(_wcsnicmp(type, L"GREAT", 5) == 0)
-                Verify_CertInfo.type = eCertGreatPatreon;
+                //Verify_CertInfo.type = eCertGreatPatreon;
+                Verify_CertInfo.type = eCertEternal;
             else if (_wcsnicmp(type, L"ENTRY", 5) == 0) { // new patreons get only 3 montgs for start
-                Verify_CertInfo.type = eCertEntryPatreon;
-                expiration_date.QuadPart = cert_date.QuadPart + KphGetDateInterval(0, 3, 0);
+                //Verify_CertInfo.type = eCertEntryPatreon;
+                //expiration_date.QuadPart = cert_date.QuadPart + KphGetDateInterval(0, 3, 0);
+				Verify_CertInfo.type = eCertEternal;
             } else
-                Verify_CertInfo.type = eCertPatreon;
+                //Verify_CertInfo.type = eCertPatreon;
+                Verify_CertInfo.type = eCertEternal;
             
         }
         // <<< patreon 
         else //if (_wcsicmp(type, L"PERSONAL") == 0 || _wcsicmp(type, L"SUPPORTER") == 0)
         {
-            Verify_CertInfo.type = eCertPersonal;
+            //Verify_CertInfo.type = eCertPersonal;
+			Verify_CertInfo.type = eCertEternal;
         }
 
         if(CertDbg)     DbgPrint("Sbie Cert type: %X\n", Verify_CertInfo.type);
@@ -1009,7 +1019,7 @@ _FX NTSTATUS KphValidateCertificate()
             }
 
             if (!Verify_CertInfo.grace_period) {
-                Verify_CertInfo.active = 0;
+                Verify_CertInfo.active = 1;
                 status = STATUS_ACCOUNT_EXPIRED;
             }
         }
