@@ -175,3 +175,5 @@ If you find Sandboxie useful, then feel free to contribute through our [Contribu
 - GunGunGun - Vietnamese
 
 All translators are encouraged to look at the [Localization notes and tips](https://git.io/J9G19) before sending a translation.
+
+Modified by githubusername2024 to make the Sandboxie work with expired certificates and treat all certificate types as Eternal.
