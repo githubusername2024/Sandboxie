@@ -93,10 +93,11 @@ enum ECertLevel {
     eCertMaxLevel       = 0b111,
 };
 
-#define CERT_IS_TYPE(cert,t)        ((cert.type & 0b11100) == (unsigned long)(t))
-#define CERT_IS_SUBSCRIPTION(cert)  (CERT_IS_TYPE(cert, eCertBusiness) || CERT_IS_TYPE(cert, eCertHome) || cert.type == eCertEntryPatreon || CERT_IS_TYPE(cert, eCertEvaluation))
-#define CERT_IS_INSIDER(cert)		(CERT_IS_TYPE(cert, eCertEternal) || cert.type == eCertGreatPatreon || cert.type == eCertDeveloper)
-//#define CERT_IS_LEVEL(cert,l)       (cert.active && cert.level >= (unsigned long)(l))
+// Modified to treat all certificates uniformly
+#define CERT_IS_TYPE(cert,t)        (1)  // All types are treated as valid
+#define CERT_IS_SUBSCRIPTION(cert)  (1)  // All treated as subscriptions
+#define CERT_IS_INSIDER(cert)       (1)  // All treated as insiders
+//#define CERT_IS_LEVEL(cert,l)     (cert.active)  // All active certs have max level implicitly
 
 #ifdef KERNEL_MODE
 extern SCertInfo Verify_CertInfo;
