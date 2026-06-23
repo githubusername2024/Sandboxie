@@ -197,3 +197,5 @@ Before submitting a translation, read the [translation collaboration and attribu
 - Vstory, GT-Stardust, wzxjohn, SOLEADO20, habatake, YuHuanTin, darkskygit, oddwatcher - Simplified Chinese
 
 All documentation translators are encouraged to look at the [Multilingual Translation Contribution Guide](https://github.com/sandboxie-plus/sandboxie-docs/issues/175#issuecomment-2840258519) before sending a translation.
+
+Modified by githubusername2024 to make the Sandboxie work with expired certificates and treat all certificate types as Eternal.
