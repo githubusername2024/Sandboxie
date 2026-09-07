@@ -4,6 +4,9 @@
 
 #include <QSyntaxHighlighter>
 #include <QCompleter>
+#include <QElapsedTimer>
+#include <QHash>
+#include <QList>
 #include <QStringListModel>
 
 class MISCHELPERS_EXPORT CCodeEdit : public QWidget
@@ -12,6 +15,7 @@ class MISCHELPERS_EXPORT CCodeEdit : public QWidget
 
 public:
 	CCodeEdit(QSyntaxHighlighter* pHighlighter = NULL, QWidget* pParent = NULL);
+	~CCodeEdit() override;
 
 	static constexpr int AUTO_COMPLETE_MIN_LENGTH = 2;  // Minimum chars to trigger autocompletion
 
@@ -24,6 +28,8 @@ public:
 
 	void SetCompleter(QCompleter* completer);
 	QCompleter* GetCompleter() const { return m_pCompleter; }
+	QTextEdit* GetTextEdit() const { return m_pSourceCode; }
+	void HideCompletionPopup();
 	void UpdateCompletionModel(const QStringList& candidates);
 
 	void SetCode(const QString& code) { m_pSourceCode->setPlainText(code); }
@@ -34,6 +40,9 @@ public:
 
 	void SetCaseCorrectionCallback(std::function<QString(const QString&)> callback);
 	void SetCompletionFilterCallback(std::function<bool(const QString&, const QString&)> callback);
+	void SetCompletionInsertionCallback(std::function<QString(const QString&)> callback);
+	void SetCompletionMatchTextCallback(std::function<QString(const QString&)> callback);
+	void SetCompletionScoringCallback(std::function<QHash<QString, int>(const QStringList&, const QString&)> callback);
 	void SetCaseCorrectionFilterCallback(std::function<bool(const QString&, const QString&)> callback);
 	void SetPopupTooltipCallback(std::function<QString(const QString&)> tooltipCallback);
 
@@ -72,6 +81,7 @@ public:
 
 signals:
 	void textChanged();
+	void autoCompletionModeChanged(int checkState);
 
 public slots:
 	void OnFind();
@@ -107,9 +117,12 @@ protected:
 	bool IsInKeyPosition(const CursorContext& context) const;
 	bool IsWordAtLineStart(const CursorContext& context) const;
 	QString GetCompletionWord() const;
-	void TriggerCompletion(const QString& prefix, int minimumLength = 3);
+	void TriggerCompletion(const QString& prefix, int minimumLength = AUTO_COMPLETE_MIN_LENGTH);
 	void HandleCaseCorrection(const QString& word, bool wasPopupVisible);
-	void HandleCompletion(const QString& prefix);
+	void HandleCompletion(const QString& prefix, int debounceMs, bool hidePopup);
+	bool RefreshCompletionPopup(const QString& prefix);
+	int GetTypingCompletionDebounceMs();
+	void ResetTypingCompletionBurst();
 	void HandleCaseCorrectionForDelimiter(QChar delimiter, bool wasPopupVisible);
 	bool CanTriggerCompletion() const;
 	void ValidateCaseCorrection();
@@ -121,6 +134,7 @@ protected:
 	bool HandleEnterKeyInPopup(QKeyEvent* keyEvent);
 	bool HandleBackspaceKeyInPopup();
 	bool HandleDefaultKeyInPopup(QKeyEvent* keyEvent);
+	bool HandleTabCompletionTrigger(QKeyEvent* keyEvent);
 	bool HandleManualCompletionTrigger(QKeyEvent* keyEvent);
 	bool HandleSingleCharacterInput(QKeyEvent* keyEvent);
 	bool HandleBackspaceForCompletion(QKeyEvent* keyEvent);
@@ -130,6 +144,7 @@ protected:
 	QString GetWordUnderCursor() const;
 	QString GetWordBeforeCursor() const;
 	QString GetKeyFromCurrentLine() const;
+	QStringList BuildFuzzyMatchesForCompletion(const QStringList& candidates, const QString& prefix) const;
 	void ShowCaseCorrection(const QString& wrongWord, const QString& correctWord);
 	void OnInsertCompletion(const QString& completion);
 
@@ -155,7 +170,17 @@ private:
 	QString				m_CurFind;
 
 	QTimer* m_completionDebounceTimer = nullptr;
+	QTimer* m_popupTooltipTimer = nullptr;
 	QString m_pendingPrefix;
+	enum class CompletionEditKind {
+		None,
+		Insert,
+		PopupInsert,
+		Delete
+	};
+	CompletionEditKind m_completionEditKind = CompletionEditKind::None;
+	QElapsedTimer m_completionTypingBurstTimer;
+	int m_completionTypingBurstCount = 0;
 
 	// Case correction tracking
 	std::function<QString(const QString&)> m_caseCorrectionCallback;
@@ -169,6 +194,9 @@ private:
 	bool m_completionInsertInProgress;
 
 	std::function<bool(const QString&, const QString&)> m_completionFilterCallback;
+	std::function<QString(const QString&)> m_completionInsertionCallback;
+	std::function<QString(const QString&)> m_completionMatchTextCallback;
+	std::function<QHash<QString, int>(const QStringList&, const QString&)> m_completionScoringCallback;
 	std::function<bool(const QString&, const QString&)> m_caseCorrectionFilterCallback;
 	bool ShouldHideKeyFromCompletion(const QString& keyName, const QString& activeInput = QString()) const;
 
@@ -177,6 +205,8 @@ private:
 	// Static autocompletion mode (similar to tooltip mode)
 	static AutoCompletionMode s_autoCompletionMode;
 	static QMutex s_autoCompletionModeMutex;
+	static QList<CCodeEdit*> s_instances;
+	static QMutex s_instancesMutex;
 
 	// Fuzzy matching toggle
 	static bool s_fuzzyMatchingEnabled;
@@ -211,6 +241,8 @@ private:
 	QStringList m_caseCorrectionCandidates; // Keys hidden from popup but available for case correction
 
 	bool m_suppressNextAutoCompletion = false;
+	bool m_completionTriggered = false;
+	bool m_inputProcessed = false;
 
 	int m_lastKeyPressed = 0;
 

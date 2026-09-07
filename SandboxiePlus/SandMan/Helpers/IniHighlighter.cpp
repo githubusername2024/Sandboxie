@@ -25,6 +25,7 @@ QHash<QString, QString> CIniHighlighter::tooltipCache;
 QMutex CIniHighlighter::tooltipCacheMutex;
 CIniHighlighter::TooltipMode CIniHighlighter::s_tooltipMode = TooltipMode::BasicInfo;
 QMutex CIniHighlighter::s_tooltipModeMutex;
+QHash<QString, SettingInfo> CIniHighlighter::templateMetadata;
 
 QString CIniHighlighter::s_tooltipBgColorDark, CIniHighlighter::s_tooltipBgColorLight;
 QString CIniHighlighter::s_tooltipTextColorDark, CIniHighlighter::s_tooltipTextColorLight;
@@ -36,6 +37,9 @@ CIniHighlighter::KeywordGroup<CIniHighlighter::KeywordType::Requirements> CIniHi
 QHash<QString, QString> CIniHighlighter::hideConfRules;
 QHash<QString, QString> CIniHighlighter::hideConfExclusions;
 QMutex CIniHighlighter::hideConfMutex;
+QHash<QString, DisabledSettingRule> CIniHighlighter::disabledSettings;
+QHash<int, QString> CIniHighlighter::disabledActionDescriptions;
+QHash<int, QMap<QString, QString>> CIniHighlighter::localizedDisabledActionDescriptions;
 
 int CIniHighlighter::s_maxSettingNameLength = 64;
 bool CIniHighlighter::s_maxSettingNameLengthValid = false;
@@ -55,6 +59,15 @@ namespace {
 	}
 
 	static QHash<QString, QString> customCompletionRules = defaultCustomCompletionRules();
+	// Protected by CIniHighlighter::settingsMutex.
+	static QStringList completionCandidatesCache;
+	static bool completionCandidatesCacheValid = false;
+
+	static void invalidateCompletionCandidatesCache()
+	{
+		completionCandidatesCache.clear();
+		completionCandidatesCacheValid = false;
+	}
 
 	// HTML fragments
     namespace HtmlTags {
@@ -118,7 +131,22 @@ namespace {
         static const QRegularExpression COMMENT_REGEX(R"(^\s*[;#].*)");
         static const QRegularExpression CLEAN_NAME_REGEX("[^a-zA-Z0-9_.]");
 		static const QRegularExpression SETTING_NAME_REGEX("^[a-zA-Z0-9_. ()-]+$");
+		static const QRegularExpression JSON_KEY_REGEX(R"("(?:(?:\\.)|[^"\\])*"(?=\s*:))");
     }
+
+	static QString findCaseInsensitiveSettingKey(const QString& keyName, const QHash<QString, SettingInfo>& settings)
+	{
+		auto exactIt = settings.constFind(keyName);
+		if (exactIt != settings.constEnd())
+			return exactIt.key();
+
+		for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
+			if (it.key().compare(keyName, Qt::CaseInsensitive) == 0)
+				return it.key();
+		}
+
+		return QString();
+	}
 
 	static QString resolveSettingLookupKey(const QString& keyName, const QHash<QString, SettingInfo>& settings)
 	{
@@ -171,10 +199,37 @@ namespace {
 		if (prefix.isEmpty())
 			return QString();
 
-		if (!prefix.endsWith(QLatin1Char('.')))
+		// A trailing wildcard denotes a prefix rule. Accept the escaped form
+		// used by the INI configuration as well.
+		if (prefix.endsWith(QLatin1Char('*')))
+			prefix.chop(1);
+		prefix.replace(QStringLiteral("\\_"), QStringLiteral("_"));
+
+		if (!prefix.endsWith(QLatin1Char('.')) && !prefix.endsWith(QLatin1Char('_')))
 			prefix.append(QLatin1Char('.'));
 
 		return prefix;
+	}
+
+	static int getCustomCompletionTrimCount(const QString& action)
+	{
+		for (const QChar& character : action) {
+			if (character.isDigit())
+				return character.digitValue();
+		}
+
+		return 0;
+	}
+
+	static QString resolveCustomCompletionBaseKey(const QString& prefix,
+		const QString& action,
+		const QHash<QString, SettingInfo>& settings)
+	{
+		const int trimCount = getCustomCompletionTrimCount(action);
+		if (trimCount > prefix.length())
+			return QString();
+
+		return findCaseInsensitiveSettingKey(prefix.left(prefix.length() - trimCount), settings);
 	}
 
 	static QString normalizeCustomCompletionAction(const QString& rawAction)
@@ -184,8 +239,102 @@ namespace {
 
 		if (action.contains(QLatin1Char('g')))
 			normalized.append(QLatin1Char('g'));
+		if (action.contains(QLatin1Char('v')))
+			normalized.append(QLatin1Char('v'));
+		for (const QChar& character : action) {
+			if (character.isDigit())
+				normalized.append(character);
+		}
 
 		return normalized;
+	}
+
+	enum class CustomCompletionResolutionPurpose {
+		ValueLookup,
+		Insertion,
+		Match
+	};
+
+	struct CustomCompletionResolution {
+		QString prefix;
+		QString baseKey;
+		QString value;
+		int trimCount = 0;
+	};
+
+	static bool resolveCustomCompletionRule(const QString& candidateKey,
+		const QHash<QString, QString>& rules,
+		const QHash<QString, SettingInfo>& settings,
+		CustomCompletionResolutionPurpose purpose,
+		CustomCompletionResolution& result)
+	{
+		int bestPrefixLength = -1;
+		QString bestPrefix;
+		CustomCompletionResolution bestResult;
+
+		for (auto it = rules.constBegin(); it != rules.constEnd(); ++it) {
+			const QString prefix = normalizeCompletionPrefix(it.key());
+			if (!it.value().contains(QLatin1Char('v'), Qt::CaseInsensitive)
+				|| !candidateKey.startsWith(prefix, Qt::CaseInsensitive))
+				continue;
+
+			const QString candidateValue = candidateKey.mid(prefix.length());
+			CustomCompletionResolution candidateResult;
+			candidateResult.prefix = prefix;
+			candidateResult.value = candidateValue;
+			if (purpose == CustomCompletionResolutionPurpose::Match) {
+				candidateResult.baseKey.clear();
+				candidateResult.trimCount = 0;
+			}
+			else {
+				const int trimCount = getCustomCompletionTrimCount(it.value());
+				if (trimCount > prefix.length() || candidateValue.isEmpty())
+					continue;
+
+				QString canonicalKey;
+				if (purpose == CustomCompletionResolutionPurpose::ValueLookup) {
+					canonicalKey = resolveCustomCompletionBaseKey(prefix, it.value(), settings);
+					if (canonicalKey.isEmpty())
+						continue;
+				}
+
+				candidateResult.baseKey = canonicalKey;
+				candidateResult.trimCount = trimCount;
+			}
+
+			const bool isBetter = prefix.length() > bestPrefixLength
+				|| (prefix.length() == bestPrefixLength
+					&& prefix.compare(bestPrefix, Qt::CaseSensitive) < 0);
+			if (isBetter) {
+				bestPrefixLength = prefix.length();
+				bestPrefix = prefix;
+				bestResult = candidateResult;
+			}
+		}
+
+		if (bestPrefixLength < 0)
+			return false;
+
+		result = bestResult;
+		return true;
+	}
+
+	static bool resolveCustomCompletionValue(const QString& candidateKey,
+		const QHash<QString, QString>& rules,
+		const QHash<QString, SettingInfo>& settings,
+		QString* baseKey,
+		QString* value)
+	{
+		CustomCompletionResolution result;
+		if (!resolveCustomCompletionRule(candidateKey, rules, settings,
+			CustomCompletionResolutionPurpose::ValueLookup, result))
+			return false;
+
+		if (baseKey)
+			*baseKey = result.baseKey;
+		if (value)
+			*value = result.value;
+		return true;
 	}
 
 	static QHash<QString, QString> parseCustomCompletionRules(const QString& rawValue)
@@ -233,6 +382,51 @@ namespace {
 		return QString();
 	}
 
+	static QString findCompletionPrefixKey(const QString& prefix,
+		const QHash<QString, SettingInfo>& settings,
+		const QHash<QString, SettingInfo>& metadata)
+	{
+		QString canonicalKey = findCanonicalPrefixKey(prefix, settings);
+		if (!canonicalKey.isEmpty())
+			return canonicalKey;
+
+		canonicalKey = findCanonicalPrefixKey(prefix, metadata);
+		if (!canonicalKey.isEmpty())
+			return canonicalKey;
+
+		for (auto it = metadata.constBegin(); it != metadata.constEnd(); ++it) {
+			if (it.key().startsWith(prefix, Qt::CaseInsensitive))
+				return prefix;
+		}
+
+		return QString();
+	}
+
+	static bool hasCompletionItemsForPrefix(const QString& prefix,
+		const QHash<QString, SettingInfo>& settings,
+		const QHash<QString, SettingInfo>& metadata,
+		const QString& action = QString())
+	{
+		for (const auto* source : { &settings, &metadata }) {
+			QString canonicalKey = findCanonicalPrefixKey(prefix, *source);
+			if (!canonicalKey.isEmpty() && !source->value(canonicalKey).completionItems.isEmpty())
+				return true;
+		}
+
+		for (auto it = metadata.constBegin(); it != metadata.constEnd(); ++it) {
+			if (it.key().startsWith(prefix, Qt::CaseInsensitive))
+				return true;
+		}
+
+		if (action.contains(QLatin1Char('v'), Qt::CaseInsensitive)) {
+			const QString sourceKey = resolveCustomCompletionBaseKey(prefix, action, settings);
+			if (!sourceKey.isEmpty() && !settings.value(sourceKey).completionItems.isEmpty())
+				return true;
+		}
+
+		return false;
+	}
+
 	static bool customGlobalHideApplies(const QString& action)
 	{
 		return action.contains(QLatin1Char('g'), Qt::CaseInsensitive);
@@ -240,6 +434,7 @@ namespace {
 
 	static bool resolveCustomRuleForInput(const QString& inputKey,
 		const QHash<QString, SettingInfo>& settings,
+		const QHash<QString, SettingInfo>& metadata,
 		QString* matchedPrefix,
 		QString* action)
 	{
@@ -259,15 +454,20 @@ namespace {
 			if (!normalizedInput.startsWith(normalizedRulePrefix, Qt::CaseInsensitive))
 				continue;
 
-			const QString canonicalPrefix = findCanonicalPrefixKey(normalizedRulePrefix, settings);
+			QString canonicalPrefix = findCompletionPrefixKey(normalizedRulePrefix, settings, metadata);
+			if (canonicalPrefix.isEmpty() && it.value().contains(QLatin1Char('v'), Qt::CaseInsensitive)
+				&& !resolveCustomCompletionBaseKey(normalizedRulePrefix, it.value(), settings).isEmpty())
+				canonicalPrefix = normalizedRulePrefix;
 			if (canonicalPrefix.isEmpty())
 				continue;
 
-			auto settingIt = settings.constFind(canonicalPrefix);
-			if (settingIt == settings.constEnd() || settingIt.value().completionItems.isEmpty())
+			if (!hasCompletionItemsForPrefix(canonicalPrefix, settings, metadata, it.value()))
 				continue;
 
-			if (canonicalPrefix.length() > longestMatch) {
+			const bool isBetter = canonicalPrefix.length() > longestMatch
+				|| (canonicalPrefix.length() == longestMatch
+					&& canonicalPrefix.compare(bestPrefix, Qt::CaseSensitive) < 0);
+			if (isBetter) {
 				longestMatch = canonicalPrefix.length();
 				bestPrefix = canonicalPrefix;
 				bestAction = it.value();
@@ -287,19 +487,46 @@ namespace {
 
 	static bool isCustomCandidateForPrefix(const QString& candidate,
 		const QString& prefix,
-		const QHash<QString, SettingInfo>& settings)
+		const QHash<QString, SettingInfo>& settings,
+		const QHash<QString, SettingInfo>& metadata,
+		const QString& action = QString())
 	{
 		if (candidate.compare(prefix, Qt::CaseInsensitive) == 0)
 			return true;
 
 		auto it = settings.constFind(prefix);
-		if (it == settings.constEnd())
-			return false;
+		if (it != settings.constEnd()) {
+			for (const QString& item : it.value().completionItems) {
+				const QString fullCandidate = prefix + item;
+				if (candidate.compare(fullCandidate, Qt::CaseInsensitive) == 0)
+					return true;
+			}
+		}
 
-		for (const QString& item : it.value().completionItems) {
-			const QString fullCandidate = prefix + item;
-			if (candidate.compare(fullCandidate, Qt::CaseInsensitive) == 0)
+		const QString metadataPrefix = findCanonicalPrefixKey(prefix, metadata);
+		if (!metadataPrefix.isEmpty()) {
+			const SettingInfo& metadataInfo = metadata.value(metadataPrefix);
+			for (const QString& item : metadataInfo.completionItems) {
+				const QString fullCandidate = metadataPrefix + item;
+				if (candidate.compare(fullCandidate, Qt::CaseInsensitive) == 0)
+					return true;
+			}
+		}
+
+		for (auto metadataIt = metadata.constBegin(); metadataIt != metadata.constEnd(); ++metadataIt) {
+			if (candidate.compare(metadataIt.key(), Qt::CaseInsensitive) == 0)
 				return true;
+		}
+
+		if (action.contains(QLatin1Char('v'), Qt::CaseInsensitive)) {
+			const QString sourceKey = resolveCustomCompletionBaseKey(prefix, action, settings);
+			if (!sourceKey.isEmpty()) {
+				for (const QString& item : settings.value(sourceKey).completionItems) {
+					const QString fullCandidate = prefix + item;
+					if (candidate.compare(fullCandidate, Qt::CaseInsensitive) == 0)
+						return true;
+				}
+			}
 		}
 
 		return false;
@@ -307,9 +534,12 @@ namespace {
 
 	static bool shouldHideCustomCandidateFromGlobalContext(const QString& inputKey,
 		const QString& candidateKey,
-		const QHash<QString, SettingInfo>& settings)
+		const QHash<QString, SettingInfo>& settings,
+		const QHash<QString, SettingInfo>& metadata)
 	{
 		const QString normalizedInput = inputKey.trimmed();
+		int bestPrefixLength = -1;
+		QString bestPrefix;
 
 		for (auto it = customCompletionRules.constBegin(); it != customCompletionRules.constEnd(); ++it) {
 			if (!customGlobalHideApplies(it.value()))
@@ -319,23 +549,140 @@ namespace {
 			if (normalizedRulePrefix.isEmpty())
 				continue;
 
-			const QString canonicalPrefix = findCanonicalPrefixKey(normalizedRulePrefix, settings);
+			QString canonicalPrefix = findCompletionPrefixKey(normalizedRulePrefix, settings, metadata);
+			if (canonicalPrefix.isEmpty() && it.value().contains(QLatin1Char('v'), Qt::CaseInsensitive)
+				&& !resolveCustomCompletionBaseKey(normalizedRulePrefix, it.value(), settings).isEmpty())
+				canonicalPrefix = normalizedRulePrefix;
 			if (canonicalPrefix.isEmpty())
 				continue;
 
-			auto settingIt = settings.constFind(canonicalPrefix);
-			if (settingIt == settings.constEnd() || settingIt.value().completionItems.isEmpty())
+			if (!hasCompletionItemsForPrefix(canonicalPrefix, settings, metadata, it.value()))
 				continue;
 
-			if (!isCustomCandidateForPrefix(candidateKey, canonicalPrefix, settings))
+			if (!isCustomCandidateForPrefix(candidateKey, canonicalPrefix, settings, metadata, it.value()))
 				continue;
 
-			if (normalizedInput.startsWith(canonicalPrefix, Qt::CaseInsensitive))
-				return false;
-
-			return true;
+			const bool isBetter = canonicalPrefix.length() > bestPrefixLength
+				|| (canonicalPrefix.length() == bestPrefixLength
+					&& canonicalPrefix.compare(bestPrefix, Qt::CaseSensitive) < 0);
+			if (isBetter) {
+				bestPrefixLength = canonicalPrefix.length();
+				bestPrefix = canonicalPrefix;
+			}
 		}
 
+		return bestPrefixLength >= 0
+			&& !normalizedInput.startsWith(bestPrefix, Qt::CaseInsensitive);
+	}
+
+	static QString getCompletionMatchTextUnlocked(const QString& candidateKey,
+		const QHash<QString, SettingInfo>& settings)
+	{
+		CustomCompletionResolution result;
+		if (resolveCustomCompletionRule(candidateKey, customCompletionRules, settings,
+			CustomCompletionResolutionPurpose::Match, result))
+			return result.value;
+
+		return candidateKey;
+	}
+
+	static QString getCompletionInitials(const QString& candidate)
+	{
+		QString initials;
+		bool atTokenStart = true;
+		for (int i = 0; i < candidate.length(); ++i) {
+			const QChar current = candidate.at(i);
+			if (current == QLatin1Char('_') || current == QLatin1Char('.')) {
+				atTokenStart = true;
+				continue;
+			}
+
+			const QChar previous = i > 0 ? candidate.at(i - 1) : QChar();
+			const QChar next = i + 1 < candidate.length() ? candidate.at(i + 1) : QChar();
+			if (atTokenStart || (current.isUpper() && previous.isLower())
+				|| (current.isUpper() && previous.isUpper() && next.isLower())) {
+				initials.append(current);
+				atTokenStart = false;
+			}
+		}
+
+		return initials;
+	}
+
+	static bool isCompletionSubsequence(const QString& input, const QString& candidate)
+	{
+		int inputIndex = 0;
+		for (const QChar& character : candidate) {
+			if (inputIndex < input.length() && input.at(inputIndex) == character)
+				++inputIndex;
+		}
+		return inputIndex == input.length();
+	}
+
+	static int getCompletionTextMatchStrength(const QString& inputKey, const QString& candidate)
+	{
+		const QString input = inputKey.trimmed().toCaseFolded();
+		const QString text = candidate.trimmed().toCaseFolded();
+		if (input.isEmpty() || text.isEmpty())
+			return 0;
+
+		if (text == input)
+			return 4;
+		if (text.startsWith(input))
+			return 3;
+		if (text.contains(input))
+			return 2;
+
+		const QString initials = getCompletionInitials(candidate).toCaseFolded();
+		if (initials == input)
+			return 4;
+		if (initials.startsWith(input))
+			return 3;
+		if (isCompletionSubsequence(input, text))
+			return 1;
+
+		return 0;
+	}
+
+	static const SettingInfo* findCompletionInfo(const QString& candidate,
+		const QHash<QString, SettingInfo>& settings,
+		const QHash<QString, SettingInfo>& metadata)
+	{
+		QString lookupKey = findCaseInsensitiveSettingKey(candidate, settings);
+		if (lookupKey.isEmpty())
+			lookupKey = findCaseInsensitiveSettingKey(resolveSettingLookupKey(candidate, settings), settings);
+		if (!lookupKey.isEmpty()) {
+			auto settingsIt = settings.constFind(lookupKey);
+			if (settingsIt != settings.constEnd())
+				return &settingsIt.value();
+		}
+
+		lookupKey = findCaseInsensitiveSettingKey(candidate, metadata);
+		if (!lookupKey.isEmpty()) {
+			auto metadataIt = metadata.constFind(lookupKey);
+			if (metadataIt != metadata.constEnd())
+				return &metadataIt.value();
+		}
+
+		QString baseKey;
+		if (resolveCustomCompletionValue(candidate, customCompletionRules, settings, &baseKey, nullptr)) {
+			lookupKey = findCaseInsensitiveSettingKey(baseKey, settings);
+			if (!lookupKey.isEmpty()) {
+				auto settingsIt = settings.constFind(lookupKey);
+				if (settingsIt != settings.constEnd())
+					return &settingsIt.value();
+			}
+		}
+
+		return nullptr;
+	}
+
+	static bool sharesCompletionCategory(const QString& first, const QString& second)
+	{
+		for (const QChar& firstCharacter : first) {
+			if (second.contains(firstCharacter))
+				return true;
+		}
 		return false;
 	}
 }
@@ -542,14 +889,21 @@ QString CIniHighlighter::mergeHtmlStyles(const QString& baseStyle, const QString
 	if (additionalStyle.isEmpty()) {
 		return baseStyle;
 	}
-	
-	if (baseStyle.contains(HtmlAttribs::STYLE_START)) {
-		QString result = baseStyle;
-		// Remove the closing quote and add the additional style
-		return result.replace(HtmlAttribs::STYLE_START, additionalStyle.mid(0, additionalStyle.length() - 1) % HtmlAttribs::SEPARATOR);
-	} else {
-		return baseStyle % " " % additionalStyle;
+
+	QString additionalCss = additionalStyle.trimmed();
+	if (additionalCss.startsWith(HtmlAttribs::STYLE_START)) {
+		additionalCss.remove(0, HtmlAttribs::STYLE_START.length());
+		if (additionalCss.endsWith('\''))
+			additionalCss.chop(1);
 	}
+
+	if (baseStyle.contains(HtmlAttribs::STYLE_START)) {
+		const int closingQuote = baseStyle.lastIndexOf('\'');
+		if (closingQuote >= 0)
+			return baseStyle.left(closingQuote) % additionalCss % baseStyle.mid(closingQuote);
+	}
+
+	return baseStyle % " " % additionalStyle;
 }
 
 void CIniHighlighter::setCurrentVersion(const QString& version)
@@ -666,6 +1020,37 @@ static void ParseTooltipColorOverride(const QString& key, const QString& value)
 	}
 }
 
+static QString ResolveTooltipStyleColor(const QString& colorValue)
+{
+	const QString trimmedColor = colorValue.trimmed();
+	if (trimmedColor.isEmpty())
+		return QString();
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+	const QStringList themedColors = trimmedColor.split(',', Qt::KeepEmptyParts);
+#else
+	const QStringList themedColors = trimmedColor.split(',', QString::KeepEmptyParts);
+#endif
+	if (themedColors.size() != 2)
+		return trimmedColor;
+
+	const QString darkColor = themedColors.value(0).trimmed();
+	const QString lightColor = themedColors.value(1).trimmed();
+	bool darkMode;
+	const int darkSetting = theConf->GetInt("Options/UseDarkTheme", 2);
+	if (darkSetting == 2) {
+		QSettings settings("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", QSettings::NativeFormat);
+		darkMode = (settings.value("AppsUseLightTheme").toInt() == 0);
+	}
+	else {
+		darkMode = (darkSetting == 1);
+	}
+
+	if (darkMode)
+		return darkColor.isEmpty() ? lightColor : darkColor;
+	return lightColor.isEmpty() ? darkColor : lightColor;
+}
+
 // Load settings from SbieSettings.ini
 void CIniHighlighter::loadSettingsIni(const QString& filePath)
 {
@@ -704,12 +1089,19 @@ void CIniHighlighter::loadSettingsIni(const QString& filePath)
         return;
     }
 
-    validSettings.clear();
-    validSettings.reserve(1000);
-    contextData.clear();
-    categoryData.clear();
-    requirementsData.clear();
-    genericStyles.clear();
+	invalidateCompletionCandidatesCache();
+
+	validSettings.clear();
+	validSettings.reserve(1000);
+	templateMetadata.clear();
+	templateMetadata.reserve(100);
+	contextData.clear();
+	categoryData.clear();
+	requirementsData.clear();
+	genericStyles.clear();
+	disabledSettings.clear();
+	disabledActionDescriptions.clear();
+	localizedDisabledActionDescriptions.clear();
 	s_masterVersion.clear();
 	ClearLanguageCache();
 	ClearHideConfCache();
@@ -726,9 +1118,10 @@ void CIniHighlighter::loadSettingsIni(const QString& filePath)
 
     QString currentSection;
     currentSection.reserve(64);
-    SettingInfo currentInfo;
-    bool inSection = false;
-    bool inConfigSection = false;
+	SettingInfo currentInfo;
+	bool inSection = false;
+	bool inConfigSection = false;
+	bool inTemplateMetadataSection = false;
 
     // Helper lambda for config accumulation
     auto accumulateConfig = [](const QString& key, const QString& value, const QString& baseKey,
@@ -754,10 +1147,14 @@ void CIniHighlighter::loadSettingsIni(const QString& filePath)
 			// Save previous section if needed
 			if (inSection && !currentSection.isEmpty() && !inConfigSection) {
 				currentInfo.name = currentSection;
-				validSettings.insert(currentInfo.name, std::move(currentInfo));
+				if (inTemplateMetadataSection)
+					templateMetadata.insert(currentInfo.name, std::move(currentInfo));
+				else
+					validSettings.insert(currentInfo.name, std::move(currentInfo));
 			}
 			currentSection = section;
 			inConfigSection = (currentSection == "___SbieSettingsConfig_");
+			inTemplateMetadataSection = currentSection.startsWith("Template_", Qt::CaseInsensitive);
 			inSection = !inConfigSection;
 			if (inSection)
 				currentInfo = SettingInfo();
@@ -780,6 +1177,14 @@ void CIniHighlighter::loadSettingsIni(const QString& filePath)
 			}
 			if (key.compare("_HideConf", Qt::CaseInsensitive) == 0) {
 				parseHideConfRules(value, hideConfRules);
+				return;
+			}
+			if (key.compare("_DisabledSettingsConf", Qt::CaseInsensitive) == 0) {
+				parseDisabledSettingsRules(value);
+				return;
+			}
+			if (key.startsWith("_DisabledSettingsActionConf", Qt::CaseInsensitive)) {
+				parseDisabledActionDescription(key, value);
 				return;
 			}
 			if (key.compare("_HideConfExclusions", Qt::CaseInsensitive) == 0) {
@@ -844,6 +1249,12 @@ void CIniHighlighter::loadSettingsIni(const QString& filePath)
 		}
 		else if (key.compare("Requirements", Qt::CaseInsensitive) == 0)
 			currentInfo.requirements = value/*.toLower()*/.trimmed();
+		else if (key.compare("CompletionScore", Qt::CaseInsensitive) == 0) {
+			bool scoreValid = false;
+			const int score = value.trimmed().toInt(&scoreValid);
+			if (scoreValid)
+				currentInfo.completionScore = qBound(-100, score, 100);
+		}
 		else if (key.compare("Completion", Qt::CaseInsensitive) == 0) {
 			const QStringList completionItems = parseCompletionItems(value);
 			for (const QString& item : completionItems)
@@ -855,9 +1266,13 @@ void CIniHighlighter::loadSettingsIni(const QString& filePath)
 	if (inSection && !currentSection.isEmpty() && !inConfigSection) {
 		currentInfo.name = currentSection;
 		currentInfo.name.remove(CompiledRegex::CLEAN_NAME_REGEX);
-		validSettings.insert(currentInfo.name, std::move(currentInfo));
+		if (inTemplateMetadataSection)
+			templateMetadata.insert(currentInfo.name, std::move(currentInfo));
+		else
+			validSettings.insert(currentInfo.name, std::move(currentInfo));
 	}
 
+	ensureDisabledSettingAliases();
 	file.close();
 
     // Deduplicate and set config mappings
@@ -918,6 +1333,7 @@ void CIniHighlighter::applyUserIniOverrides(const QString& masterVersion, const 
 
 	// Only process user ini if version matches
 	if (!masterVersion.isEmpty() && !userVersion.isEmpty() && s_masterVersion == userVersion) {
+		invalidateCompletionCandidatesCache();
 		ClearHideConfCache();
 		for (const auto& pair : userLines) {
 			const QString& key = pair.first;
@@ -931,6 +1347,12 @@ void CIniHighlighter::applyUserIniOverrides(const QString& masterVersion, const 
 			else if (key.compare("_HideConf", Qt::CaseInsensitive) == 0) {
 				parseHideConfRules(value, hideConfRules);
 			}
+			else if (key.compare("_DisabledSettingsConf", Qt::CaseInsensitive) == 0) {
+				parseDisabledSettingsRules(value);
+			}
+			else if (key.startsWith("_DisabledSettingsActionConf", Qt::CaseInsensitive)) {
+				parseDisabledActionDescription(key, value);
+			}
 			else if (key.compare("_HideConfExclusions", Qt::CaseInsensitive) == 0) {
 				parseHideConfRules(value, hideConfExclusions);
 			}
@@ -939,6 +1361,8 @@ void CIniHighlighter::applyUserIniOverrides(const QString& masterVersion, const 
 				customCompletionRules = parsedRules.isEmpty() ? defaultCustomCompletionRules() : parsedRules;
 			}
 		}
+		ensureDisabledSettingAliases();
+		ClearLanguageCache();
 		qDebug() << "[validSettings] Successfully loaded user overrides from"
 			<< userIniPath
 			<< "with" << userLines.size() << "entries";
@@ -1085,12 +1509,18 @@ void CIniHighlighter::appendGenericTooltipRow(QString& tooltip, const QString& l
 
 void CIniHighlighter::appendMultiLineTooltipRow(QString& tooltip, const QString& label, 
 	const QStringList& lines, const QString& labelStyle, const QString& valuePrefix,
-	const QString& settingName, bool applySpecialFormatting)
+	const QString& settingName, bool applySpecialFormatting, const TooltipCellStyles& cellStyles)
 {
 	if (lines.isEmpty()) return;
 	
-	tooltip += HtmlTags::TR_TD_START % labelStyle % HtmlAttribs::STYLE_TOP 
-		% HtmlTags::TAG_CLOSE % label % HtmlTags::TD_END % HtmlTags::TD_TAG;
+	const QString valueStyle = cellStyles.right.toHtmlStyle();
+	const QString valueCellTag = valueStyle.isEmpty()
+		? HtmlTags::TD_TAG
+		: HtmlTags::TD_START % valueStyle % HtmlTags::TAG_CLOSE;
+	const QString rowLabelStyle = mergeHtmlStyles(labelStyle, HtmlAttribs::STYLE_TOP);
+
+	tooltip += HtmlTags::TR_TD_START % rowLabelStyle
+		% HtmlTags::TAG_CLOSE % label % HtmlTags::TD_END % valueCellTag;
 	
 	for (int i = 0; i < lines.size(); ++i) {
 		QString processedLine = processTextLineOptimized(lines[i], settingName);
@@ -1150,20 +1580,21 @@ void CIniHighlighter::appendMultiLineTooltipRow(QString& tooltip, const QString&
 }
 
 // Helper to generate a table row for syntax or description
-void CIniHighlighter::appendTableRowForContent(QString& tooltip, const QString& label, const QString& content, const QString& labelStyle, const QString& valuePrefix, const QString& settingName, bool isSyntax)
+void CIniHighlighter::appendTableRowForContent(QString& tooltip, const QString& label, const QString& content, const QString& labelStyle, const QString& valuePrefix, const QString& settingName, bool isSyntax, const QString& styleKey)
 {
     if (content.isEmpty())
         return;
         
     QStringList lines = content.split('\n');
     // Use genericStyles for label and value cell if defined
-    QString rowType = isSyntax ? "Syntax" : "Description";
+    QString rowType = styleKey.isEmpty() ? (isSyntax ? "Syntax" : "Description") : styleKey;
     TooltipCellStyles styles = getGenericStyles(rowType);
     
     QString styledLabelStyle = mergeHtmlStyles(labelStyle, styles.left.toHtmlStyle());
     
     // Use the unified multi-line tooltip row method
-    appendMultiLineTooltipRow(tooltip, label, lines, styledLabelStyle, valuePrefix, settingName, isSyntax);
+	appendMultiLineTooltipRow(tooltip, label, lines, styledLabelStyle, valuePrefix, settingName,
+		isSyntax, styleKey.isEmpty() ? TooltipCellStyles{} : styles);
 }
 
 QString CIniHighlighter::processTextLineOptimized(const QString& text, const QString& settingName)
@@ -1453,12 +1884,13 @@ void CIniHighlighter::highlightBlock(const QString &text)
 			int start = keyMatch.capturedStart(1);
 			int length = keyName.length();
 			const QString lookupKey = resolveSettingLookupKey(keyName, validSettings);
+			const auto settingIt = validSettings.constFind(lookupKey);
 
-			if (validSettings.isEmpty() || !validSettings.contains(lookupKey)) {
+			if (settingIt == validSettings.constEnd()) {
 				setFormat(start, length, unknownKeyFormat); // underline unknown keys
 			}
 			else {
-				const SettingInfo& info = validSettings[lookupKey];
+				const SettingInfo& info = settingIt.value();
 				QTextCharFormat formatToUse = determineKeyFormat(info, m_currentVersion,
 					keyFormat, futureKeyFormat, removedKeyFormat, renamedKeyFormat, unknownKeyFormat);
 				setFormat(start, length, formatToUse);
@@ -1572,8 +2004,7 @@ void CIniHighlighter::highlightBlock(const QString &text)
             if (braceCounter == 0) {
                 // Found a JSON substring from startBrace to endBrace-1
                 QString jsonString = valueText.mid(startBrace, endBrace - startBrace);
-                QRegularExpression keyRegex(R"("(?:(?:\\.)|[^"\\])*"(?=\s*:))");
-                QRegularExpressionMatchIterator keyMatches = keyRegex.globalMatch(jsonString);
+                QRegularExpressionMatchIterator keyMatches = CompiledRegex::JSON_KEY_REGEX.globalMatch(jsonString);
                 while (keyMatches.hasNext()) {
                     QRegularExpressionMatch keyMatch = keyMatches.next();
                     int keyStart = valueStart + startBrace + keyMatch.capturedStart();
@@ -1686,7 +2117,7 @@ void CIniHighlighter::processMappingsOptimized(QString& tooltip, const SettingIn
 
 	// Process context mappings with action fallback
 	if (!info.context.isEmpty()) {
-		auto effectiveMappings = getEffectiveMappingsWithActionFallback(contextData, currentLang);
+		auto effectiveMappings = getDisplayableContextMappings(currentLang);
 		processKeywordMappings<KeywordInfo<KeywordType::Context>>(
 			info.context, effectiveMappings, contextLabel,
 			labelStyle, HtmlTags::VALUE_PREFIX, contextData.tooltipStyle, tooltip);
@@ -1733,6 +2164,56 @@ void CIniHighlighter::processMappingsOptimized(QString& tooltip, const SettingIn
 			}
 		}
 	}
+}
+
+QString CIniHighlighter::getContextWarningTemplate(const QString& currentLang)
+{
+	auto effectiveMappings = getEffectiveMappingsWithActionFallback(contextData, currentLang);
+	for (const auto& mapping : effectiveMappings) {
+		if (mapping.keyword.compare(QStringLiteral("w"), Qt::CaseInsensitive) == 0)
+			return mapping.displayName;
+	}
+	return QString();
+}
+
+CIniHighlighter::KeywordMappings<CIniHighlighter::KeywordType::Context> CIniHighlighter::getDisplayableContextMappings(const QString& currentLang)
+{
+	auto effectiveMappings = getEffectiveMappingsWithActionFallback(contextData, currentLang);
+	KeywordMappings<KeywordType::Context> displayableMappings;
+	for (const auto& mapping : effectiveMappings) {
+		if (mapping.keyword.compare(QStringLiteral("w"), Qt::CaseInsensitive) != 0)
+			displayableMappings.append(mapping);
+	}
+	return displayableMappings;
+}
+
+QString CIniHighlighter::buildContextWarning(const SettingInfo& info, char currentContext, const QString& currentLang)
+{
+	if (currentContext == '\0' || info.context.isEmpty())
+		return QString();
+
+	const QChar contextId = QLatin1Char(currentContext);
+	if (info.context.contains(QString(contextId), Qt::CaseInsensitive))
+		return QString();
+
+	const auto displayableMappings = getDisplayableContextMappings(currentLang);
+	QString currentLabel;
+	for (const auto& mapping : displayableMappings) {
+		if (mapping.keyword.compare(QString(contextId), Qt::CaseInsensitive) == 0) {
+			currentLabel = mapping.displayName;
+			break;
+		}
+	}
+
+	const QStringList expectedLabels = getVisibleLabelsWithActionHiding<KeywordInfo<KeywordType::Context>>(info.context, displayableMappings);
+	if (currentLabel.isEmpty() || expectedLabels.isEmpty())
+		return QString();
+
+	const QString warningTemplate = getContextWarningTemplate(currentLang);
+	if (warningTemplate.isEmpty())
+		return QString();
+
+	return warningTemplate.arg(expectedLabels.join(QStringLiteral(" + ")), currentLabel);
 }
 
 QTextCharFormat CIniHighlighter::determineKeyFormat(const SettingInfo& info, const QVersionNumber& currentVersion,
@@ -1898,6 +2379,239 @@ QString CIniHighlighter::sanitizeHtmlInput(const QString& input)
 	return sanitized;
 }
 
+QString CIniHighlighter::makeTooltipCacheKey(const QString& prefix, const QString& settingName, const QString& settingValue, char currentContext)
+{
+	return prefix + QChar(0x1f) + settingName + QChar(0x1f) + settingValue + QChar(0x1f) + QString::number(static_cast<unsigned char>(currentContext));
+}
+
+bool CIniHighlighter::findDisabledSettingRule(const QString& settingName, DisabledSettingRule& rule)
+{
+	auto it = disabledSettings.constFind(settingName);
+	if (it != disabledSettings.constEnd()) {
+		rule = it.value();
+		return true;
+	}
+
+	for (auto searchIt = disabledSettings.constBegin(); searchIt != disabledSettings.constEnd(); ++searchIt) {
+		if (searchIt.key().compare(settingName, Qt::CaseInsensitive) == 0) {
+			rule = searchIt.value();
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void CIniHighlighter::ensureDisabledSettingAliases()
+{
+	// Keep configured disabled/enabled pairs valid even when the placeholder section is omitted.
+	for (auto it = disabledSettings.constBegin(); it != disabledSettings.constEnd(); ++it) {
+		if (!findCaseInsensitiveSettingKey(it.key(), validSettings).isEmpty())
+			continue;
+
+		const QString enabledKey = findCaseInsensitiveSettingKey(it.value().enabledKey, validSettings);
+		if (enabledKey.isEmpty())
+			continue;
+
+		SettingInfo aliasInfo = validSettings.value(enabledKey);
+		aliasInfo.name = it.key();
+		validSettings.insert(it.key(), std::move(aliasInfo));
+	}
+}
+
+static int getDisabledActionIndex(const DisabledSettingRule& rule)
+{
+	for (const QChar& character : rule.actions) {
+		if (character.isDigit())
+			return character.digitValue();
+	}
+
+	return 0;
+}
+
+static void prependTooltipText(QString& target, const QString& prefix)
+{
+	if (prefix.isEmpty())
+		return;
+
+	if (target.isEmpty())
+		target = prefix;
+	else {
+		target.prepend(QLatin1Char('\n'));
+		target.prepend(prefix);
+	}
+}
+
+void CIniHighlighter::mergeMissingSettingInfo(SettingInfo& target, const SettingInfo& fallback)
+{
+	if (target.name.isEmpty()) target.name = fallback.name;
+	if (target.addedVersion.isEmpty()) target.addedVersion = fallback.addedVersion;
+	if (target.removedVersion.isEmpty()) target.removedVersion = fallback.removedVersion;
+	if (target.readdedVersion.isEmpty()) target.readdedVersion = fallback.readdedVersion;
+	if (target.renamedVersion.isEmpty()) target.renamedVersion = fallback.renamedVersion;
+	if (target.supersededBy.isEmpty()) target.supersededBy = fallback.supersededBy;
+	if (target.category.isEmpty()) target.category = fallback.category;
+	if (target.context.isEmpty()) target.context = fallback.context;
+	if (target.syntax.isEmpty()) target.syntax = fallback.syntax;
+	if (target.description.isEmpty()) target.description = fallback.description;
+	if (target.requirements.isEmpty()) target.requirements = fallback.requirements;
+	if (target.completionScore == 0) target.completionScore = fallback.completionScore;
+
+	for (auto it = fallback.localizedSyntax.constBegin(); it != fallback.localizedSyntax.constEnd(); ++it) {
+		if (!target.localizedSyntax.contains(it.key()))
+			target.localizedSyntax.insert(it.key(), it.value());
+	}
+	for (auto it = fallback.localizedDescriptions.constBegin(); it != fallback.localizedDescriptions.constEnd(); ++it) {
+		if (!target.localizedDescriptions.contains(it.key()))
+			target.localizedDescriptions.insert(it.key(), it.value());
+	}
+
+	for (const QString& item : fallback.completionItems)
+		appendUniqueCaseInsensitive(target.completionItems, item);
+}
+
+void CIniHighlighter::prependDisabledActionDescription(SettingInfo& info, const DisabledSettingRule& rule)
+{
+	const int actionIndex = getDisabledActionIndex(rule);
+	const QString defaultDescription = disabledActionDescriptions.value(actionIndex);
+	const QString descriptionWithoutAction = info.description;
+	prependTooltipText(info.description, defaultDescription);
+
+	QSet<QString> languages;
+	for (auto it = info.localizedDescriptions.constBegin(); it != info.localizedDescriptions.constEnd(); ++it)
+		languages.insert(it.key());
+	const QMap<QString, QString> localizedActions = localizedDisabledActionDescriptions.value(actionIndex);
+	for (auto it = localizedActions.constBegin(); it != localizedActions.constEnd(); ++it)
+		languages.insert(it.key());
+
+	for (const QString& language : languages) {
+		const QString localizedDescription = localizedActions.value(language, defaultDescription);
+		QString& target = info.localizedDescriptions[language];
+		if (target.isEmpty())
+			target = descriptionWithoutAction;
+		prependTooltipText(target, localizedDescription);
+	}
+}
+
+SettingInfo CIniHighlighter::resolveSettingInfo(const QString& settingName, const QString& settingValue)
+{
+	const QString normalizedSettingName = settingName.trimmed();
+	QString lookupKey = resolveSettingLookupKey(normalizedSettingName, validSettings);
+	QString effectiveSettingValue = settingValue.trimmed();
+	bool isCustomCompletionValue = false;
+	if (!validSettings.contains(lookupKey)) {
+		const QString metadataKey = findCaseInsensitiveSettingKey(normalizedSettingName, templateMetadata);
+		if (!metadataKey.isEmpty() && metadataKey.startsWith(QStringLiteral("Template_"), Qt::CaseInsensitive)) {
+			lookupKey = findCaseInsensitiveSettingKey(QStringLiteral("Template"), validSettings);
+			if (!lookupKey.isEmpty())
+				effectiveSettingValue = metadataKey.mid(QStringLiteral("Template_").length());
+		}
+		else {
+			QString customBaseKey;
+			QString customValue;
+			if (resolveCustomCompletionValue(normalizedSettingName, customCompletionRules, validSettings,
+				&customBaseKey, &customValue)) {
+				lookupKey = customBaseKey;
+				effectiveSettingValue = customValue;
+				isCustomCompletionValue = true;
+			}
+		}
+	}
+
+	auto settingIt = validSettings.constFind(lookupKey);
+	if (settingIt == validSettings.constEnd())
+		return SettingInfo();
+
+	SettingInfo info = settingIt.value();
+
+	DisabledSettingRule disabledRule;
+	if (findDisabledSettingRule(lookupKey, disabledRule)) {
+		const QString enabledLookupKey = resolveSettingLookupKey(disabledRule.enabledKey, validSettings);
+		auto enabledIt = validSettings.constFind(enabledLookupKey);
+		if (enabledIt != validSettings.constEnd()) {
+			const int actionIndex = getDisabledActionIndex(disabledRule);
+			const QString baseDescription = disabledActionDescriptions.value(0);
+			const QString actionDescription = disabledActionDescriptions.value(actionIndex);
+			if ((!baseDescription.isEmpty() && info.description == baseDescription)
+				|| (!actionDescription.isEmpty() && info.description == actionDescription))
+				info.description.clear();
+
+			const QMap<QString, QString> baseLocalizedActions = localizedDisabledActionDescriptions.value(0);
+			const QMap<QString, QString> localizedActions = localizedDisabledActionDescriptions.value(actionIndex);
+			QSet<QString> localizedLanguages;
+			for (auto it = baseLocalizedActions.constBegin(); it != baseLocalizedActions.constEnd(); ++it)
+				localizedLanguages.insert(it.key());
+			for (auto it = localizedActions.constBegin(); it != localizedActions.constEnd(); ++it)
+				localizedLanguages.insert(it.key());
+			for (const QString& language : localizedLanguages) {
+				auto descriptionIt = info.localizedDescriptions.find(language);
+				if (descriptionIt == info.localizedDescriptions.end())
+					continue;
+				const QString baseDescription = baseLocalizedActions.value(language);
+				const QString actionDescription = localizedActions.value(language);
+				if (descriptionIt.value() == baseDescription || descriptionIt.value() == actionDescription)
+					info.localizedDescriptions.erase(descriptionIt);
+			}
+
+			mergeMissingSettingInfo(info, enabledIt.value());
+		}
+		prependDisabledActionDescription(info, disabledRule);
+	}
+
+	const bool isTemplateSetting = lookupKey.compare(QStringLiteral("Template"), Qt::CaseInsensitive) == 0
+		|| lookupKey.compare(QStringLiteral("TemplateReject"), Qt::CaseInsensitive) == 0;
+	const bool isTemplateReject = lookupKey.compare(QStringLiteral("TemplateReject"), Qt::CaseInsensitive) == 0;
+	SettingInfo rejectInfo;
+	if (isTemplateReject) {
+		rejectInfo = info;
+		const QString templateKey = findCaseInsensitiveSettingKey(QStringLiteral("Template"), validSettings);
+		if (!templateKey.isEmpty()) {
+			SettingInfo templateInfo = validSettings.value(templateKey);
+			mergeMissingSettingInfo(templateInfo, rejectInfo);
+			info = templateInfo;
+		}
+	}
+	if (isTemplateSetting && !effectiveSettingValue.isEmpty()) {
+		const QString specializedKey = findCaseInsensitiveSettingKey(
+			QStringLiteral("Template_") % effectiveSettingValue, templateMetadata);
+		if (!specializedKey.isEmpty()) {
+			SettingInfo specializedInfo = templateMetadata.value(specializedKey);
+			const bool hasSpecializedSyntax = !specializedInfo.syntax.isEmpty()
+				|| !specializedInfo.localizedSyntax.isEmpty();
+			mergeMissingSettingInfo(specializedInfo, info);
+			if (!hasSpecializedSyntax) {
+				specializedInfo.syntax = lookupKey % QLatin1Char('=') % effectiveSettingValue;
+				specializedInfo.localizedSyntax.clear();
+			}
+			info = specializedInfo;
+		}
+		else if (isCustomCompletionValue) {
+			info.syntax = lookupKey % QLatin1Char('=') % effectiveSettingValue;
+			info.localizedSyntax.clear();
+		}
+	}
+	if (isTemplateReject) {
+		if (!rejectInfo.description.isEmpty() && !info.description.endsWith(rejectInfo.description)) {
+			if (!info.description.isEmpty())
+				info.description += QLatin1Char('\n');
+			info.description += rejectInfo.description;
+		}
+		for (auto it = rejectInfo.localizedDescriptions.constBegin(); it != rejectInfo.localizedDescriptions.constEnd(); ++it) {
+			if (!it.value().isEmpty()) {
+				QString& description = info.localizedDescriptions[it.key()];
+				if (description.isEmpty())
+					description = info.description;
+				if (!description.endsWith(it.value())) {
+					description += QLatin1Char('\n');
+					description += it.value();
+				}
+			}
+		}
+	}
+
+	return info;
+}
+
 bool CIniHighlighter::IsCommentLine(const QString& line)
 {
 	// Skip lines that start with # or ; (after optional whitespace)
@@ -1926,30 +2640,39 @@ bool CIniHighlighter::isValidForTooltip(const QString& settingName)
 	}
 
 	const QString lookupKey = resolveSettingLookupKey(normalizedSettingName, validSettings);
-	
-	return settingsLoaded && !validSettings.isEmpty() && validSettings.contains(lookupKey);
+	if (!settingsLoaded)
+		return false;
+
+	if (!validSettings.isEmpty() && validSettings.contains(lookupKey))
+		return true;
+
+	if (!templateMetadata.isEmpty()
+		&& !findCaseInsensitiveSettingKey(normalizedSettingName, templateMetadata).isEmpty())
+		return true;
+
+	return resolveCustomCompletionValue(normalizedSettingName, customCompletionRules, validSettings, nullptr, nullptr);
 }
 
-QString CIniHighlighter::GetBasicSettingTooltip(const QString& settingName)
+QString CIniHighlighter::GetBasicSettingTooltip(const QString& settingName, const QString& settingValue, char currentContext)
 {
 	TooltipMode mode = GetTooltipMode();
 	if (mode == TooltipMode::Disabled) {
 		return QString();
 	}
 	if (mode == TooltipMode::FullTooltip) {
-		return GetSettingTooltip(settingName);
+		return GetSettingTooltip(settingName, settingValue, currentContext);
 	}
 	if (!isValidForTooltip(settingName))
 		return QString();
 
-	QString cacheKey = settingName % QStringLiteral("_basic");
+	const QString cacheKey = makeTooltipCacheKey(QStringLiteral("basic"), settingName, settingValue, currentContext);
 	// basic tooltip: only version rows + description (or syntax if description missing) with special-case logic
 	return getOrSetTooltipCache(cacheKey, [=]() {
-		return BuildTooltipCore(settingName, /*includeMappings=*/false, /*includeContent=*/false, /*reserveSize=*/1024, /*preferDescriptionFirst=*/true);
+		return buildTooltipCore(settingName, /*includeMappings=*/false, /*includeContent=*/false, /*reserveSize=*/1024, /*preferDescriptionFirst=*/true, settingValue, currentContext);
 		});
 }
 
-QString CIniHighlighter::GetSettingTooltip(const QString& settingName)
+QString CIniHighlighter::GetSettingTooltip(const QString& settingName, const QString& settingValue, char currentContext)
 {
 	TooltipMode mode = GetTooltipMode();
 
@@ -1957,39 +2680,45 @@ QString CIniHighlighter::GetSettingTooltip(const QString& settingName)
 	// to be able to show helpful content. Use the popup-specific generator
 	// as a fallback in that case.
 	if (mode == TooltipMode::Disabled) {
-		return GetSettingTooltipForPopup(settingName);
+		return GetSettingTooltipForPopup(settingName, settingValue, currentContext);
 	}
 
 	if (mode == TooltipMode::BasicInfo) {
-		return GetBasicSettingTooltip(settingName);
+		return GetBasicSettingTooltip(settingName, settingValue, currentContext);
 	}
 
 	if (!isValidForTooltip(settingName))
 		return QString();
 
 	// full tooltip: include mappings + full content
-	return getOrSetTooltipCache(settingName, [=]() {
-		return BuildTooltipCore(settingName, /*includeMappings=*/true, /*includeContent=*/true, /*reserveSize=*/2048, /*preferDescriptionFirst=*/true);
+	const QString cacheKey = makeTooltipCacheKey(QStringLiteral("full"), settingName, settingValue, currentContext);
+	return getOrSetTooltipCache(cacheKey, [=]() {
+		return buildTooltipCore(settingName, /*includeMappings=*/true, /*includeContent=*/true, /*reserveSize=*/2048, /*preferDescriptionFirst=*/true, settingValue, currentContext);
 		});
 }
 
 // Helper to build popup tooltip content for Basic or Full popup modes.
-QString CIniHighlighter::BuildPopupTooltip(const QString& settingName, bool basic)
+QString CIniHighlighter::BuildPopupTooltip(const QString& settingName, bool basic, const QString& settingValue, char currentContext)
 {
 	// Popup basic == same semantics as hover basic (selective version rows + description/syntax)
 	// Popup full == full tooltip (mappings + content)
 	if (!isValidForTooltip(settingName))
 		return QString();
 
+	return buildPopupTooltipCore(settingName, basic, settingValue, currentContext);
+}
+
+QString CIniHighlighter::buildPopupTooltipCore(const QString& settingName, bool basic, const QString& settingValue, char currentContext)
+{
 	if (basic) {
-		return BuildTooltipCore(settingName, /*includeMappings=*/false, /*includeContent=*/false, /*reserveSize=*/1024, /*preferDescriptionFirst=*/true);
+		return buildTooltipCore(settingName, /*includeMappings=*/false, /*includeContent=*/false, /*reserveSize=*/1024, /*preferDescriptionFirst=*/true, settingValue, currentContext);
 	}
 	else {
-		return BuildTooltipCore(settingName, /*includeMappings=*/true, /*includeContent=*/true, /*reserveSize=*/2048, /*preferDescriptionFirst=*/true);
+		return buildTooltipCore(settingName, /*includeMappings=*/true, /*includeContent=*/true, /*reserveSize=*/2048, /*preferDescriptionFirst=*/true, settingValue, currentContext);
 	}
 }
 
-QString CIniHighlighter::GetSettingTooltipForPopup(const QString& settingName)
+QString CIniHighlighter::GetSettingTooltipForPopup(const QString& settingName, const QString& settingValue, char currentContext)
 {
 	// Determine configured modes
 	int iniMode = theConf->GetInt("Options/EnableIniTooltips", static_cast<int>(GetTooltipMode()));
@@ -2005,27 +2734,30 @@ QString CIniHighlighter::GetSettingTooltipForPopup(const QString& settingName)
 
 	// Basic popup tooltip
 	if (popupMode == Qt::PartiallyChecked) {
-		QString cacheKey = QStringLiteral("popup_basic_") + settingName;
+		const QString cacheKey = makeTooltipCacheKey(QStringLiteral("popup_basic"), settingName, settingValue, currentContext);
 		return getOrSetTooltipCache(cacheKey, [=]() {
-			return BuildPopupTooltip(settingName, /*basic=*/true);
+			return buildPopupTooltipCore(settingName, /*basic=*/true, settingValue, currentContext);
 			});
 	}
 
 	// Full popup tooltip
-	QString cacheKey = QStringLiteral("popup_") + settingName;
+	const QString cacheKey = makeTooltipCacheKey(QStringLiteral("popup"), settingName, settingValue, currentContext);
 	return getOrSetTooltipCache(cacheKey, [=]() {
-		return BuildPopupTooltip(settingName, /*basic=*/false);
+		return buildPopupTooltipCore(settingName, /*basic=*/false, settingValue, currentContext);
 		});
 }
 
-QString CIniHighlighter::BuildTooltipCore(const QString& settingName, bool includeMappings, bool includeContent, int reserveSize, bool preferDescriptionFirst)
+QString CIniHighlighter::BuildTooltipCore(const QString& settingName, bool includeMappings, bool includeContent, int reserveSize, bool preferDescriptionFirst, const QString& settingValue, char currentContext)
 {
-	const QString normalizedSettingName = settingName.trimmed();
-
-	// Common guard
-	if (!isValidForTooltip(normalizedSettingName))
+	if (!isValidForTooltip(settingName))
 		return QString();
 
+	return buildTooltipCore(settingName, includeMappings, includeContent, reserveSize, preferDescriptionFirst, settingValue, currentContext);
+}
+
+QString CIniHighlighter::buildTooltipCore(const QString& settingName, bool includeMappings, bool includeContent, int reserveSize, bool preferDescriptionFirst, const QString& settingValue, char currentContext)
+{
+	const QString normalizedSettingName = settingName.trimmed();
 	const TooltipThemeCache& themeCache = getTooltipThemeCache();
 	QString tooltip;
 	tooltip.reserve(reserveSize);
@@ -2034,19 +2766,28 @@ QString CIniHighlighter::BuildTooltipCore(const QString& settingName, bool inclu
 	if (!isValidForTooltip(normalizedSettingName))
 		return QString();
 
-	const QString lookupKey = resolveSettingLookupKey(normalizedSettingName, validSettings);
-	if (!validSettings.contains(lookupKey))
+	const SettingInfo info = resolveSettingInfo(normalizedSettingName, settingValue);
+	if (info.name.isEmpty())
 		return QString();
-
-	const SettingInfo& info = validSettings[lookupKey];
 	const QString currentLang = getCurrentLanguage();
+	QString contentSettingName = normalizedSettingName;
+	QString customBaseKey;
+	if (resolveCustomCompletionValue(normalizedSettingName, customCompletionRules, validSettings,
+		&customBaseKey, nullptr))
+		contentSettingName = customBaseKey;
+	QString headerName = normalizedSettingName;
+	if ((normalizedSettingName.compare(QStringLiteral("Template"), Qt::CaseInsensitive) == 0
+		|| normalizedSettingName.compare(QStringLiteral("TemplateReject"), Qt::CaseInsensitive) == 0)
+		&& !settingValue.trimmed().isEmpty()
+		&& info.name.startsWith(QStringLiteral("Template_"), Qt::CaseInsensitive))
+		headerName = info.name;
 
 	// Header
 	tooltip = HtmlTags::HTML_START % HtmlTags::TABLE_START % themeCache.tableStyle % HtmlTags::TAG_CLOSE;
 	TooltipCellStyles headerStyles = getGenericStyles("Header");
 	QString headerStyleStr = headerStyles.left.toHtmlStyle();
 	tooltip += HtmlTags::TABLE_HEADER_START % headerStyleStr % HtmlTags::TAG_CLOSE
-		% normalizedSettingName % HtmlTags::TD_END % HtmlTags::TR_END;
+		% headerName % HtmlTags::TD_END % HtmlTags::TR_END;
 
 	// Basic (no includeContent) special-case: selective version rows and content fallback
 	if (!includeContent) {
@@ -2080,12 +2821,12 @@ QString CIniHighlighter::BuildTooltipCore(const QString& settingName, bool inclu
 			appendVersionRow(supersededByLabel, info.supersededBy, "SupersededBy");
 			QString description = selectLocalizedContentOptimized(info.description, info.localizedDescriptions, currentLang);
 			if (!description.isEmpty()) {
-				appendTableRowForContent(tooltip, tr("Description"), description, themeCache.labelStyle, HtmlTags::VALUE_PREFIX, normalizedSettingName, false);
+				appendTableRowForContent(tooltip, tr("Description"), description, themeCache.labelStyle, HtmlTags::VALUE_PREFIX, contentSettingName, false);
 			}
 			else {
 				QString syntax = selectLocalizedContentOptimized(info.syntax, info.localizedSyntax, currentLang);
 				if (!syntax.isEmpty()) {
-					appendTableRowForContent(tooltip, tr("Syntax"), syntax, themeCache.labelStyle, HtmlTags::VALUE_PREFIX, normalizedSettingName, true);
+					appendTableRowForContent(tooltip, tr("Syntax"), syntax, themeCache.labelStyle, HtmlTags::VALUE_PREFIX, contentSettingName, true);
 				}
 			}
 		}
@@ -2095,8 +2836,12 @@ QString CIniHighlighter::BuildTooltipCore(const QString& settingName, bool inclu
 		addVersionRows(tooltip, info, themeCache.labelStyle);
 		if (includeMappings)
 			processMappingsOptimized(tooltip, info, currentLang, themeCache.labelStyle);
-		processContentOptimized(tooltip, info, currentLang, normalizedSettingName, themeCache.labelStyle);
+		processContentOptimized(tooltip, info, currentLang, contentSettingName, themeCache.labelStyle);
 	}
+
+	const QString contextWarning = buildContextWarning(info, currentContext, currentLang);
+	if (!contextWarning.isEmpty())
+		appendTableRowForContent(tooltip, tr("Attention"), contextWarning, themeCache.labelStyle, HtmlTags::VALUE_PREFIX, contentSettingName, false, QStringLiteral("ContextAttention"));
 
 	tooltip += HtmlTags::TABLE_END % HtmlTags::HTML_END;
 	return tooltip;
@@ -2185,14 +2930,22 @@ QStringList CIniHighlighter::GetCompletionCandidates()
 	if (!settingsLoaded || validSettings.isEmpty()) {
 		return QStringList();
 	}
+	if (completionCandidatesCacheValid)
+		return completionCandidatesCache;
 	
 	QStringList candidates;
 	candidates.reserve(validSettings.size() + 64);
+	QSet<QString> seenCandidates;
+	seenCandidates.reserve(validSettings.size() + 64);
 
-	auto appendCandidate = [&candidates](const QString& candidate) {
+	auto appendCandidate = [&candidates, &seenCandidates](const QString& candidate) {
 		if (candidate.isEmpty())
 			return;
-		appendUniqueCaseInsensitive(candidates, candidate);
+		const QString normalizedCandidate = candidate.toCaseFolded();
+		if (seenCandidates.contains(normalizedCandidate))
+			return;
+		seenCandidates.insert(normalizedCandidate);
+		candidates.append(candidate);
 	};
 	
 	for (auto it = validSettings.constBegin(); it != validSettings.constEnd(); ++it) {
@@ -2228,9 +2981,170 @@ QStringList CIniHighlighter::GetCompletionCandidates()
 
 	for (auto it = effectiveRules.constBegin(); it != effectiveRules.constEnd(); ++it)
 		appendPrefixedCompletions(it.key(), validSettings);
+
+	for (auto it = effectiveRules.constBegin(); it != effectiveRules.constEnd(); ++it) {
+		if (!it.value().contains(QLatin1Char('v'), Qt::CaseInsensitive))
+			continue;
+
+		const QString candidatePrefix = normalizeCompletionPrefix(it.key());
+		const QString sourceKey = resolveCustomCompletionBaseKey(
+			candidatePrefix, it.value(), validSettings);
+		if (sourceKey.isEmpty())
+			continue;
+
+		const SettingInfo& sourceInfo = validSettings.value(sourceKey);
+		for (const QString& item : sourceInfo.completionItems)
+			appendCandidate(candidatePrefix + item);
+	}
+
+	for (auto it = effectiveRules.constBegin(); it != effectiveRules.constEnd(); ++it) {
+		const QString prefix = normalizeCompletionPrefix(it.key());
+		for (auto metadataIt = templateMetadata.constBegin(); metadataIt != templateMetadata.constEnd(); ++metadataIt) {
+			if (metadataIt.key().startsWith(prefix, Qt::CaseInsensitive))
+				appendCandidate(metadataIt.key());
+		}
+
+		const QString metadataPrefix = findCanonicalPrefixKey(prefix, templateMetadata);
+		if (!metadataPrefix.isEmpty()) {
+			const SettingInfo& metadataInfo = templateMetadata.value(metadataPrefix);
+			for (const QString& item : metadataInfo.completionItems)
+				appendCandidate(metadataPrefix + item);
+		}
+	}
 	
 	candidates.sort(Qt::CaseInsensitive);
-	return candidates;
+	completionCandidatesCache = candidates;
+	completionCandidatesCacheValid = true;
+	return completionCandidatesCache;
+}
+
+QString CIniHighlighter::GetCompletionInsertionText(const QString& candidateKey)
+{
+	QMutexLocker locker(&settingsMutex);
+
+	CustomCompletionResolution result;
+	if (resolveCustomCompletionRule(candidateKey, customCompletionRules, validSettings,
+		CustomCompletionResolutionPurpose::Insertion, result))
+		return result.prefix.left(result.prefix.length() - result.trimCount) % QLatin1Char('=') % result.value;
+
+	return candidateKey;
+}
+
+QString CIniHighlighter::GetCompletionMatchText(const QString& candidateKey)
+{
+	QMutexLocker locker(&settingsMutex);
+	return getCompletionMatchTextUnlocked(candidateKey, validSettings);
+}
+
+QHash<QString, int> CIniHighlighter::GetCompletionScores(const QStringList& candidates, const QString& inputKey)
+{
+	QMutexLocker locker(&settingsMutex);
+	QHash<QString, int> scores;
+	if (!settingsLoaded || validSettings.isEmpty() || candidates.isEmpty())
+		return scores;
+
+	const QString input = getCompletionMatchTextUnlocked(inputKey.trimmed(), validSettings);
+	if (input.trimmed().isEmpty())
+		return scores;
+
+	struct CandidateMatch {
+		QString key;
+		QString category;
+		int strength;
+	};
+	QList<CandidateMatch> matches;
+	matches.reserve(candidates.size());
+	QHash<QString, QString> candidatesByName;
+	candidatesByName.reserve(candidates.size());
+	QHash<QString, int> configuredScores;
+	configuredScores.reserve(candidates.size());
+
+	for (const QString& candidate : candidates) {
+		if (candidate.isEmpty())
+			continue;
+		candidatesByName.insert(candidate.toCaseFolded(), candidate);
+
+		const QString matchText = getCompletionMatchTextUnlocked(candidate, validSettings);
+		const int strength = getCompletionTextMatchStrength(input, matchText);
+		const SettingInfo* info = findCompletionInfo(candidate, validSettings, templateMetadata);
+		matches.append(CandidateMatch{ candidate, info ? info->category : QString(), strength });
+
+		if (info && info->completionScore != 0) {
+			const int configuredScore = qBound(-100, info->completionScore, 100);
+			configuredScores.insert(candidate, configuredScore);
+			if (strength > 0)
+				scores.insert(candidate, configuredScore);
+		}
+	}
+
+	auto addScoreForCandidate = [&scores, &configuredScores, &candidatesByName](const QString& key, int delta) {
+		const QString candidate = candidatesByName.value(key.toCaseFolded());
+		if (candidate.isEmpty())
+			return;
+
+		const int currentScore = scores.contains(candidate)
+			? scores.value(candidate)
+			: configuredScores.value(candidate, 0);
+		scores.insert(candidate, qBound(-100, currentScore + delta, 100));
+	};
+
+	// A matched disabled/enabled pair is a strong signal in both directions.
+	for (auto it = disabledSettings.constBegin(); it != disabledSettings.constEnd(); ++it) {
+		const int disabledStrength = getCompletionTextMatchStrength(input, it.key());
+		const int enabledStrength = getCompletionTextMatchStrength(input, it.value().enabledKey);
+		if (disabledStrength >= 3)
+			addScoreForCandidate(it.value().enabledKey, 60);
+		if (enabledStrength >= 3)
+			addScoreForCandidate(it.key(), 60);
+	}
+
+	// Category affinity is deliberately weak and case-sensitive. This keeps
+	// Resource (r) separate from Restrictions (R).
+	QStringList matchedCategories;
+	for (const CandidateMatch& match : matches) {
+		if (match.strength >= 3 && !match.category.isEmpty()
+			&& !matchedCategories.contains(match.category))
+			matchedCategories.append(match.category);
+	}
+	for (const CandidateMatch& related : matches) {
+		if (related.strength <= 0 || related.category.isEmpty())
+			continue;
+		for (const QString& category : matchedCategories) {
+			if (sharesCompletionCategory(category, related.category)) {
+				addScoreForCandidate(related.key, 8);
+				break;
+			}
+		}
+	}
+
+	// Keep a small, lower-priority set of same-category candidates visible even
+	// when the category seed is the only textual match. This helps queries such
+	// as OFP discover other Resource settings without flooding the popup.
+	static constexpr int kMaxCategoryRelatedCandidates = 12;
+	int categoryRelatedCount = 0;
+	for (const CandidateMatch& related : matches) {
+		if (related.strength > 0 || related.category.isEmpty())
+			continue;
+
+		bool sameCategory = false;
+		for (const QString& category : matchedCategories) {
+			if (sharesCompletionCategory(category, related.category)) {
+				sameCategory = true;
+				break;
+			}
+		}
+		if (!sameCategory)
+			continue;
+
+		const bool alreadyScored = scores.contains(related.key);
+		if (alreadyScored || categoryRelatedCount < kMaxCategoryRelatedCandidates) {
+			addScoreForCandidate(related.key, 8);
+			if (!alreadyScored)
+				++categoryRelatedCount;
+		}
+	}
+
+	return scores;
 }
 
 QString CIniHighlighter::FindCaseCorrectedKey(const QString& wrongKey)
@@ -2274,24 +3188,37 @@ bool CIniHighlighter::IsKeyHiddenFromPopup(const QString& keyName)
 
 	// Then check the existing version-based logic
 	QMutexLocker locker(&settingsMutex);
-	if (!settingsLoaded || validSettings.isEmpty())
+	if (!settingsLoaded)
 		return false;
 
 	const QString lookupKey = resolveSettingLookupKey(keyName.trimmed(), validSettings);
 	auto it = validSettings.constFind(lookupKey);
-	if (it == validSettings.constEnd())
+	const SettingInfo* info = it != validSettings.constEnd() ? &it.value() : nullptr;
+	if (!info) {
+		const QString metadataKey = findCaseInsensitiveSettingKey(keyName.trimmed(), templateMetadata);
+		auto metadataIt = templateMetadata.constFind(metadataKey);
+		if (metadataIt != templateMetadata.constEnd())
+			info = &metadataIt.value();
+	}
+	if (!info)
 		return false;
 
-	const SettingInfo& info = it.value();
 	const QVersionNumber currentVersion = getCurrentVersion();
+	const bool showFutureSettings = theConf->GetBool("Options/ShowFutureSettings", true);
 
+	// Do not suggest future settings when the editor option is disabled.
+	if (!showFutureSettings && !info->addedVersion.isEmpty()) {
+		const QVersionNumber addedVer = QVersionNumber::fromString(info->addedVersion);
+		if (!addedVer.isNull() && currentVersion < addedVer)
+			return true;
+	}
 	// Check for removed
-	if (!info.removedVersion.isEmpty()) {
-		QVersionNumber removedVer = QVersionNumber::fromString(info.removedVersion);
+	if (!info->removedVersion.isEmpty()) {
+		QVersionNumber removedVer = QVersionNumber::fromString(info->removedVersion);
 		if (!removedVer.isNull() && currentVersion >= removedVer) {
 			// If readded, only hide if not readded yet
-			if (!info.readdedVersion.isEmpty()) {
-				QVersionNumber readdedVer = QVersionNumber::fromString(info.readdedVersion);
+			if (!info->readdedVersion.isEmpty()) {
+				QVersionNumber readdedVer = QVersionNumber::fromString(info->readdedVersion);
 				if (!readdedVer.isNull() && currentVersion < readdedVer)
 					return true;
 				if (!readdedVer.isNull() && currentVersion >= readdedVer)
@@ -2301,8 +3228,8 @@ bool CIniHighlighter::IsKeyHiddenFromPopup(const QString& keyName)
 		}
 	}
 	// Check for renamed
-	if (!info.renamedVersion.isEmpty()) {
-		QVersionNumber renamedVer = QVersionNumber::fromString(info.renamedVersion);
+	if (!info->renamedVersion.isEmpty()) {
+		QVersionNumber renamedVer = QVersionNumber::fromString(info->renamedVersion);
 		if (!renamedVer.isNull() && currentVersion >= renamedVer)
 			return true;
 	}
@@ -2311,20 +3238,28 @@ bool CIniHighlighter::IsKeyHiddenFromPopup(const QString& keyName)
 
 bool CIniHighlighter::ShouldHideCompletionCandidate(const QString& inputKey, const QString& candidateKey, char context)
 {
-	Q_UNUSED(context);
 	QMutexLocker locker(&settingsMutex);
 
 	if (!settingsLoaded || validSettings.isEmpty() || candidateKey.isEmpty())
 		return false;
 
-	QString matchedPrefix;
-	QString action;
-	if (resolveCustomRuleForInput(inputKey, validSettings, &matchedPrefix, &action)
-		&& customGlobalHideApplies(action)) {
-		return !isCustomCandidateForPrefix(candidateKey, matchedPrefix, validSettings);
+	DisabledSettingRule disabledRule;
+	if (findDisabledSettingRule(candidateKey, disabledRule)) {
+		const QString normalizedInput = inputKey.trimmed();
+		if (normalizedInput.isEmpty() && disabledRule.actions.contains(QLatin1Char('g')))
+			return true;
+		if (context != '\0' && disabledRule.actions.contains(QLatin1Char(context)))
+			return true;
 	}
 
-	if (shouldHideCustomCandidateFromGlobalContext(inputKey, candidateKey, validSettings))
+	QString matchedPrefix;
+	QString action;
+	if (resolveCustomRuleForInput(inputKey, validSettings, templateMetadata, &matchedPrefix, &action)
+		&& customGlobalHideApplies(action)) {
+		return !isCustomCandidateForPrefix(candidateKey, matchedPrefix, validSettings, templateMetadata, action);
+	}
+
+	if (shouldHideCustomCandidateFromGlobalContext(inputKey, candidateKey, validSettings, templateMetadata))
 		return true;
 
 	return false;
@@ -2352,6 +3287,56 @@ void CIniHighlighter::parseHideConfRules(const QString& value, QHash<QString, QS
 			}
 		}
 	}
+}
+
+void CIniHighlighter::parseDisabledSettingsRules(const QString& value)
+{
+	QString normalized = value;
+	normalized.replace(QStringLiteral("\\n"), QStringLiteral(";"));
+	normalized.replace(QLatin1Char('\n'), QLatin1Char(';'));
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+	const QStringList ruleStrings = normalized.split(';', Qt::SkipEmptyParts);
+#else
+	const QStringList ruleStrings = normalized.split(';', QString::SkipEmptyParts);
+#endif
+
+	for (const QString& ruleString : ruleStrings) {
+		const QStringList parts = ruleString.split('|');
+		if (parts.size() < 2)
+			continue;
+
+		const QString disabledKey = parts[0].trimmed();
+		const QString enabledKey = parts[1].trimmed();
+		if (disabledKey.isEmpty() || enabledKey.isEmpty())
+			continue;
+
+		DisabledSettingRule rule;
+		rule.enabledKey = enabledKey;
+		rule.actions = parts.size() >= 3 ? parts[2].trimmed().toLower() : QString();
+		disabledSettings.insert(disabledKey, rule);
+	}
+}
+
+void CIniHighlighter::parseDisabledActionDescription(const QString& key, const QString& value)
+{
+	static const QRegularExpression actionKeyRegex(
+		QStringLiteral("^_DisabledSettingsActionConf(?:_([0-9]+))?(?:_([a-z0-9_-]+))?$"),
+		QRegularExpression::CaseInsensitiveOption);
+	const QRegularExpressionMatch match = actionKeyRegex.match(key);
+	if (!match.hasMatch())
+		return;
+
+	const int actionIndex = match.captured(1).isEmpty() ? 0 : match.captured(1).toInt();
+	if (actionIndex < 0 || actionIndex > 9)
+		return;
+
+	const QString processedValue = processTextLineOptimized(sanitizeHtmlInput(value), QString());
+	const QString language = match.captured(2).toLower();
+	if (language.isEmpty())
+		disabledActionDescriptions.insert(actionIndex, processedValue);
+	else
+		localizedDisabledActionDescriptions[actionIndex].insert(language, processedValue);
 }
 
 bool CIniHighlighter::matchesWildcard(const QString& pattern, const QString& text)
@@ -2434,7 +3419,9 @@ bool CIniHighlighter::IsKeyHiddenFromContext(const QString& keyName, char contex
 QString CIniHighlighter::TooltipStyle::toHtmlStyle() const {
 	QStringList styles;
 	if (!color.isEmpty()) {
-		styles << HtmlAttribs::COLOR_VAR.arg(color);
+		const QString resolvedColor = ResolveTooltipStyleColor(color);
+		if (!resolvedColor.isEmpty())
+			styles << HtmlAttribs::COLOR_VAR.arg(resolvedColor);
 	}
 	if (bold) {
 		styles << HtmlAttribs::STYLE_BOLD;
@@ -2464,16 +3451,29 @@ QString CIniHighlighter::TooltipStyle::toHtmlStyle() const {
 
 bool CIniHighlighter::IsValidTooltipContext(const QString& hoveredText)
 {
-	if (hoveredText.isEmpty() || hoveredText.length() > getMaxSettingNameLengthOrDefault())
+	const QString normalizedText = hoveredText.trimmed();
+	if (normalizedText.isEmpty())
+		return false;
+
+	const int equalsPos = normalizedText.indexOf('=');
+	if (equalsPos > 0) {
+		const QString settingName = normalizedText.left(equalsPos).trimmed();
+		if ((settingName.compare(QStringLiteral("Template"), Qt::CaseInsensitive) == 0
+			|| settingName.compare(QStringLiteral("TemplateReject"), Qt::CaseInsensitive) == 0)
+			&& isValidForTooltip(settingName))
+			return true;
+	}
+
+	if (normalizedText.length() > getMaxSettingNameLengthOrDefault())
 		return false;
 
 	// Check for exact match at start of line
-	if (isValidForTooltip(hoveredText))
+	if (isValidForTooltip(normalizedText))
 		return true;
 
 	// Check for SettingName= (no trailing content), must be at start of line
-	if (hoveredText.endsWith('=') && hoveredText.length() > 1) {
-		QString name = hoveredText.left(hoveredText.length() - 1);
+	if (normalizedText.endsWith('=') && normalizedText.length() > 1) {
+		QString name = normalizedText.left(normalizedText.length() - 1);
 		if (isValidForTooltip(name))
 			return true;
 	}
@@ -2500,6 +3500,12 @@ int CIniHighlighter::getMaxSettingNameLengthOrDefault()
 			//qDebug() << "Key:" << key << "Length:" << currentLength;
 			maxLength = currentLength;
 		}
+	}
+
+	for (const auto& key : templateMetadata.keys()) {
+		int currentLength = key.length();
+		if (currentLength > maxLength)
+			maxLength = currentLength;
 	}
 
 	s_maxSettingNameLength = (maxLength > 0) ? maxLength : 32;
@@ -2573,7 +3579,10 @@ void CIniHighlighter::reloadUserIniIfNeeded(const QString& userIniPath, const QF
 	}
 
 	if (needToLoadUserIni) {
-		applyUserIniOverrides(s_masterVersion, userIniPath);
+		// Rebuild the master data before applying user overrides so removed user
+		// entries do not remain in the cached configuration.
+		const QString settingsPath = QCoreApplication::applicationDirPath() % "/" % DEFAULT_SETTINGS_FILE % ".ini";
+		loadSettingsIni(settingsPath);
 		lastUserFileModified = userFileInfo.lastModified();
 		userIniLoaded = true;
 	}
@@ -2586,10 +3595,14 @@ void CIniHighlighter::reloadUserIniIfNeeded(const QString& userIniPath, const QF
 
 void CIniHighlighter::MarkSettingsDirty()
 {
+	QMutexLocker locker(&settingsMutex);
 	settingsDirty = true;
+	invalidateCompletionCandidatesCache();
 }
 
 void CIniHighlighter::MarkUserSettingsDirty()
 {
+	QMutexLocker locker(&settingsMutex);
 	userSettingsDirty = true;
+	invalidateCompletionCandidatesCache();
 }

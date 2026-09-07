@@ -173,6 +173,13 @@ Qt::CheckState CSettingsWindow__Int2Chk(int state)
 	}
 }
 
+static bool CSettingsWindow__IsPendingHighlightEnabled(Qt::CheckState state)
+{
+	if (state == Qt::PartiallyChecked)
+		return theConf->GetInt("Options/ViewMode", 1) != 2;
+	return state == Qt::Checked;
+}
+
 quint32 g_FeatureFlags = 0;
 
 QByteArray g_Certificate;
@@ -314,6 +321,7 @@ CSettingsWindow::CSettingsWindow(QWidget* parent)
 			QString Lang = Locale.nativeLanguageName();
 			ui.uiLang->addItem(Lang, Code);
 		}
+		ui.uiLang->addItem(tr("Arabic (Morocco) - LTR"), "ar_MA");
 		ui.uiLang->setCurrentIndex(ui.uiLang->findData(theConf->GetString("Options/UiLanguage")));
 	}
 
@@ -339,6 +347,10 @@ CSettingsWindow::CSettingsWindow(QWidget* parent)
 	ui.cmbOnClose->addItem(tr("Prompt before Close"), "Prompt");
 	ui.cmbOnClose->addItem(tr("Close"), "Close");
 	ui.cmbOnClose->addItem(tr("Hide (Run invisible in Background)"), "Hide");
+	ui.cmbBoxAliasDisplayMode->addItem(tr("Sandbox name"), 1);
+	ui.cmbBoxAliasDisplayMode->addItem(tr("Sandbox alias"), 0);
+	ui.cmbBoxAliasDisplayMode->addItem(tr("Sandbox alias and name"), 2);
+	ui.cmbBoxAliasDisplayMode->setCurrentIndex(1);
 
 	const QString sameAsMainLabel = tr("Same as main");
 	const QString keepCurrentLabel = tr("Keep current monitor");
@@ -517,6 +529,7 @@ CSettingsWindow::CSettingsWindow(QWidget* parent)
 	connect(ui.chkRecoveryTop, SIGNAL(stateChanged(int)), this, SLOT(OnOptChanged()));
 
 	connect(ui.chkUseW11Style, SIGNAL(stateChanged(int)), this, SLOT(OnOptChanged()));
+	connect(ui.chkRandomGuidName, SIGNAL(stateChanged(int)), this, SLOT(OnOptChanged()));
 	QOperatingSystemVersion current = QOperatingSystemVersion::current();
 	ui.chkUseW11Style->setEnabled(current.majorVersion() == 10 && current.microVersion() >= 22000); // Windows 10 22000+ (Windows 11)
 	//
@@ -551,6 +564,7 @@ CSettingsWindow::CSettingsWindow(QWidget* parent)
 	connect(ui.chkCompactTray, SIGNAL(stateChanged(int)), this, SLOT(OnChangeGUI()));
 	connect(ui.cmbOnClose, SIGNAL(currentIndexChanged(int)), this, SLOT(OnOptChanged()));
 	connect(ui.chkBoxOpsNotify, SIGNAL(stateChanged(int)), this, SLOT(OnOptChanged()));
+	connect(ui.chkTraySearch, SIGNAL(stateChanged(int)), this, SLOT(OnChangeGUI()));
 	connect(ui.chkMinimize, SIGNAL(stateChanged(int)), this, SLOT(OnOptChanged()));
 	connect(ui.chkSingleShow, SIGNAL(stateChanged(int)), this, SLOT(OnOptChanged()));
 	connect(ui.chkTrayIcons, SIGNAL(stateChanged(int)), this, SLOT(OnOptChanged()));
@@ -596,6 +610,7 @@ CSettingsWindow::CSettingsWindow(QWidget* parent)
 	connect(ui.chkColorIcons, SIGNAL(stateChanged(int)), this, SLOT(OnChangeGUI()));
 	connect(ui.chkOverlayIcons, SIGNAL(stateChanged(int)), this, SLOT(OnChangeGUI()));
 	connect(ui.chkHideCore, SIGNAL(stateChanged(int)), this, SLOT(OnOptChanged()));
+	connect(ui.chkHighlightPendingChanges, SIGNAL(stateChanged(int)), this, SLOT(OnOptChanged()));
 	connect(ui.cmbGrouping, SIGNAL(currentIndexChanged(int)), this, SLOT(OnOptChanged()));
 	connect(ui.cmbLaunchMonitor, SIGNAL(currentIndexChanged(int)), this, SLOT(OnOptChanged()));
 	connect(ui.cmbNonMainLaunchMonitor, SIGNAL(currentIndexChanged(int)), this, SLOT(OnOptChanged()));
@@ -681,6 +696,7 @@ CSettingsWindow::CSettingsWindow(QWidget* parent)
 	connect(ui.chkSbieLogon, SIGNAL(stateChanged(int)), this, SLOT(OnGeneralChanged()));
 	connect(ui.chkSbieAll, SIGNAL(stateChanged(int)), this, SLOT(OnGeneralChanged()));
 	connect(ui.chkSbieUAC, SIGNAL(stateChanged(int)), this, SLOT(OnGeneralChanged()));
+	connect(ui.cmbBoxAliasDisplayMode, SIGNAL(currentIndexChanged(int)), this, SLOT(OnGeneralChanged()));
 	m_GeneralChanged = false;
 
 	connect(ui.chkWatchConfig, SIGNAL(stateChanged(int)), this, SLOT(OnOptChanged())); // not sbie ini
@@ -840,24 +856,19 @@ CSettingsWindow::CSettingsWindow(QWidget* parent)
 		CCodeEdit::SetPopupTooltipsEnabled(popupMode);
 	}
 
-	// Set up autocompletion based on mode
-	QCompleter* completer = new QCompleter(this);
-	completer->setModelSorting(QCompleter::CaseInsensitivelySortedModel);
-	completer->setFilterMode(Qt::MatchContains);
-	m_pCodeEdit->SetCompleter(CCodeEdit::GetAutoCompletionMode() != CCodeEdit::AutoCompletionMode::Disabled ? completer : nullptr);
-
-	// Set completer based on mode
-	if (CCodeEdit::GetAutoCompletionMode() != CCodeEdit::AutoCompletionMode::Disabled) {
-		m_pCodeEdit->SetCompleter(completer);
-	}
-	else {
-		m_pCodeEdit->SetCompleter(nullptr);
-	}
-	
 	m_pCodeEdit->SetCompletionFilterCallback([](const QString& keyName, const QString& inputKey) -> bool {
 		return CIniHighlighter::IsKeyHiddenFromPopup(keyName)
 			|| CIniHighlighter::ShouldHideCompletionCandidate(inputKey, keyName, 'p');
-		});
+	});
+	m_pCodeEdit->SetCompletionInsertionCallback([](const QString& candidateKey) -> QString {
+		return CIniHighlighter::GetCompletionInsertionText(candidateKey);
+	});
+	m_pCodeEdit->SetCompletionMatchTextCallback([](const QString& candidateKey) -> QString {
+		return CIniHighlighter::GetCompletionMatchText(candidateKey);
+	});
+	m_pCodeEdit->SetCompletionScoringCallback([](const QStringList& candidates, const QString& inputKey) -> QHash<QString, int> {
+		return CIniHighlighter::GetCompletionScores(candidates, inputKey);
+	});
 	m_pCodeEdit->SetCaseCorrectionCallback([](const QString& wrongKey) -> QString {
 		return CIniHighlighter::FindCaseCorrectedKey(wrongKey);
 		});
@@ -866,13 +877,10 @@ CSettingsWindow::CSettingsWindow(QWidget* parent)
 			|| CIniHighlighter::ShouldHideCompletionCandidate(inputKey, keyName, 'c');
 		});
 	m_pCodeEdit->SetPopupTooltipCallback([](const QString& keyName) -> QString {
-		return CIniHighlighter::GetSettingTooltipForPopup(keyName);
+		return CIniHighlighter::GetSettingTooltipForPopup(keyName, QString(), 'g');
 		});
-	
-	// Update completion model with current settings if auto completion is enabled
-	if (CCodeEdit::GetAutoCompletionMode() != CCodeEdit::AutoCompletionMode::Disabled) {
-		UpdateAutoCompletion();
-	}
+	connect(m_pCodeEdit, SIGNAL(autoCompletionModeChanged(int)), this, SLOT(OnAutoCompletionModeChanged(int)));
+	ApplyAutoCompletionMode(static_cast<int>(CCodeEdit::GetAutoCompletionMode()));
 
 	ApplyIniEditFont();
 
@@ -955,6 +963,31 @@ void CSettingsWindow::UpdateAutoCompletion()
 
 	// Update the completion model
 	m_pCodeEdit->UpdateCompletionModel(candidates);
+}
+
+void CSettingsWindow::ApplyAutoCompletionMode(int state)
+{
+	if (!m_pCodeEdit)
+		return;
+
+	if (!m_pCodeEdit->GetCompleter()) {
+		QCompleter* completer = new QCompleter(m_pCodeEdit);
+		completer->setModelSorting(QCompleter::CaseInsensitivelySortedModel);
+		completer->setFilterMode(Qt::MatchContains);
+		m_pCodeEdit->SetCompleter(completer);
+	}
+
+	if (state == Qt::Unchecked) {
+		m_pCodeEdit->HideCompletionPopup();
+		return;
+	}
+
+	UpdateAutoCompletion();
+}
+
+void CSettingsWindow::OnAutoCompletionModeChanged(int state)
+{
+	ApplyAutoCompletionMode(state);
 }
 
 void CSettingsWindow::OnSelectIniEditFont()
@@ -1078,6 +1111,7 @@ bool CSettingsWindow::eventFilter(QObject *source, QEvent *event)
 		static bool m_bRightButtonPressed = false;
 
 		if (event->type() == QEvent::FocusIn && ui.txtCertificate->property("hidden").toBool())	{
+			QSignalBlocker Blocker(ui.txtCertificate);
 			ui.txtCertificate->setProperty("hidden", false);
 			ui.txtCertificate->setPlainText(g_Certificate);
 			ui.txtCertificate->setProperty("modified", false);
@@ -1087,6 +1121,7 @@ bool CSettingsWindow::eventFilter(QObject *source, QEvent *event)
 		}
 		else if (event->type() == QEvent::FocusOut && !ui.txtCertificate->property("hidden").toBool()) {
 			if (!ui.txtCertificate->property("modified").toBool() && !m_bRightButtonPressed) {
+				QSignalBlocker Blocker(ui.txtCertificate);
 				ui.txtCertificate->setProperty("hidden", true);
 				int Pos = g_Certificate.indexOf("HWID:");
 				if (Pos == -1)
@@ -1115,7 +1150,7 @@ bool CSettingsWindow::eventFilter(QObject *source, QEvent *event)
 		QHelpEvent* helpEvent = static_cast<QHelpEvent*>(event);
 
 		// Find the text edit widget inside CCodeEdit
-		QTextEdit* pTextEdit = m_pCodeEdit->findChild<QTextEdit*>();
+		QTextEdit* pTextEdit = m_pCodeEdit->GetTextEdit();
 		if (pTextEdit) {
 			// Convert mouse position to text cursor position
 			QPoint pos = pTextEdit->viewport()->mapFrom(m_pCodeEdit, helpEvent->pos());
@@ -1128,14 +1163,6 @@ bool CSettingsWindow::eventFilter(QObject *source, QEvent *event)
 			// Don't show tooltips for comment lines
 			if (CIniHighlighter::IsCommentLine(currentLine))
 				return false;
-
-			// Check if we're on the value side of the equals sign (after the =)
-			int equalsPos = currentLine.indexOf('=');
-			if (equalsPos >= 0 && (cursor.position() - block.position()) > equalsPos) {
-				// We're in the value part, don't show tooltip
-				QToolTip::hideText();
-				return false;
-			}
 
 			// Custom word selection that includes dots and underscores
 			int initialPos = cursor.position() - block.position();
@@ -1167,7 +1194,9 @@ bool CSettingsWindow::eventFilter(QObject *source, QEvent *event)
 					QString settingName = currentLine.mid(startPos, endPos - startPos);
 					if (settingName.endsWith('='))
 						settingName.chop(1);
-					QString tooltipText = CIniHighlighter::GetSettingTooltip(settingName);
+					const int equalsIndex = currentLine.indexOf('=');
+					const QString settingValue = equalsIndex >= 0 ? currentLine.mid(equalsIndex + 1).trimmed() : QString();
+					QString tooltipText = CIniHighlighter::GetSettingTooltip(settingName, settingValue, 'g');
 					if (!tooltipText.isEmpty()) {
 						QToolTip::showText(helpEvent->globalPos(), tooltipText, pTextEdit);
 						return true;
@@ -1379,6 +1408,8 @@ void CSettingsWindow::LoadSettings()
 	ui.chkColorIcons->setChecked(theConf->GetBool("Options/ColorBoxIcons", false));
 	ui.chkOverlayIcons->setChecked(theConf->GetBool("Options/UseOverlayIcons", true));
 	ui.chkHideCore->setChecked(theConf->GetBool("Options/HideSbieProcesses", false));
+	ui.chkHighlightPendingChanges->setCheckState(CSettingsWindow__Int2Chk(theConf->GetInt("Options/HighlightPendingChanges", 2)));
+	m_PendingChanges.SetEnabled(CSettingsWindow__IsPendingHighlightEnabled(ui.chkHighlightPendingChanges->checkState()), m_pTree);
 	ui.cmbGrouping->setCurrentIndex(theConf->GetInt("Options/BoxGroupHandling", 0));
 	
 
@@ -1432,6 +1463,7 @@ void CSettingsWindow::LoadSettings()
 	ui.cmbSysTray->setCurrentIndex(theConf->GetInt("Options/SysTrayIcon", 1));
 	ui.cmbTrayBoxes->setCurrentIndex(theConf->GetInt("Options/SysTrayFilter", 0));
 	ui.chkCompactTray->setChecked(theConf->GetBool("Options/CompactTray", false));
+	ui.chkTraySearch->setChecked(theConf->GetBool("Options/TraySearch", true));
 	ui.chkTrayIcons->setChecked(theConf->GetBool("Options/TrayIcons", true));
 	ui.chkTrayOverlayIcons->setChecked(theConf->GetBool("Options/TrayOverlayIcons", true));
 	ui.chkTrayUseAlias->setChecked(theConf->GetBool("Options/TrayUseAlias", true));
@@ -1509,6 +1541,7 @@ void CSettingsWindow::LoadSettings()
 	ui.chkSingleShow->setChecked(theConf->GetBool("Options/TraySingleClick", false));
 
 	ui.chkUseW11Style->setChecked(theConf->GetBool("Options/UseW11Style", false));
+	ui.chkRandomGuidName->setChecked(theConf->GetBool("Options/UseRandomBoxName", false));
 
 	OnLoadAddon();
 
@@ -1532,7 +1565,7 @@ void CSettingsWindow::LoadSettings()
 		
 		ui.cmbDefault->clear();
 		foreach(const CSandBoxPtr & pBox, theAPI->GetAllBoxes())
-			ui.cmbDefault->addItem(pBox.objectCast<CSandBoxPlus>()->GetDisplayName(), pBox->GetName());
+			ui.cmbDefault->addItem(pBox.objectCast<CSandBoxPlus>()->GetDisplayName(CSandBoxPlus::eDisplayCompact), pBox->GetName());
 		int pos = ui.cmbDefault->findData(theAPI->GetGlobalSettings()->GetText("DefaultBox", "DefaultBox"));
 		if(pos == -1)
 			pos = ui.cmbDefault->findData("DefaultBox");
@@ -1565,6 +1598,10 @@ void CSettingsWindow::LoadSettings()
 		ui.chkSbieLogon->setChecked(theAPI->GetGlobalSettings()->GetBool("SandboxieLogon", false));
 		ui.chkSbieAll->setChecked(theAPI->GetGlobalSettings()->GetBool("SandboxieAllGroup", true));
 		ui.chkSbieUAC->setChecked(theAPI->GetGlobalSettings()->GetBool("UseSandboxieUAC", true));
+		int iBoxAliasDisplayMode = theAPI->GetGlobalSettings()->GetNum("BoxAliasDisplayMode", 2);
+		if (iBoxAliasDisplayMode < 0 || iBoxAliasDisplayMode > 2)
+			iBoxAliasDisplayMode = 2;
+		ui.cmbBoxAliasDisplayMode->setCurrentIndex(ui.cmbBoxAliasDisplayMode->findData(iBoxAliasDisplayMode));
 
 		ui.treeImport->clear();
 		foreach(const QString& Value, theAPI->GetGlobalSettings()->GetTextList("ImportBox", false))
@@ -1629,8 +1666,8 @@ void CSettingsWindow::LoadSettings()
 				Icon = theGUI->GetColorIcon(pBoxEx->GetColor(), pBox->GetActiveProcessCount());
 			else
 				Icon = theGUI->GetBoxIcon(pBoxEx->GetType(), pBox->GetActiveProcessCount() != 0);
-			ui.cmbMoTWSandbox->addItem(Icon, pBoxEx->GetDisplayName(), pBox->GetName());
-			ui.cmbUsbSandbox->addItem(Icon, pBoxEx->GetDisplayName(), pBox->GetName());
+			ui.cmbMoTWSandbox->addItem(Icon, pBoxEx->GetDisplayName(CSandBoxPlus::eDisplayCompact), pBox->GetName());
+			ui.cmbUsbSandbox->addItem(Icon, pBoxEx->GetDisplayName(CSandBoxPlus::eDisplayCompact), pBox->GetName());
 		}
 		ui.cmbMoTWSandbox->setCurrentIndex(CurMoTWBox);
 		ui.cmbUsbSandbox->setCurrentIndex(CurUsbBox);
@@ -1657,6 +1694,7 @@ void CSettingsWindow::LoadSettings()
 		ui.chkSbieLogon->setEnabled(false);
 		ui.chkSbieAll->setEnabled(false);
 		ui.chkSbieUAC->setEnabled(false);
+		ui.cmbBoxAliasDisplayMode->setEnabled(false);
 		ui.regRoot->setEnabled(false);
 		ui.ipcRoot->setEnabled(false);
 		ui.chkRamDisk->setEnabled(false);
@@ -1734,6 +1772,10 @@ void CSettingsWindow::LoadSettings()
 
 	//ui.chkUpdateTemplates->setEnabled(g_CertInfo.active && !g_CertInfo.expired);
 	ui.chkUpdateIssues->setEnabled(g_CertInfo.active && !g_CertInfo.expired);
+	m_PendingChanges.CaptureItemBaselines(m_pTree);
+	m_PendingChanges.CaptureCheckboxBaselines();
+	m_PendingChanges.CaptureRadioButtonBaselines();
+	m_PendingChanges.CaptureValueBaselines();
 }
 
 void CSettingsWindow::OnRamDiskChange()
@@ -1957,6 +1999,7 @@ void CSettingsWindow::SaveSettings()
 	theConf->SetValue("Options/ColorBoxIcons", ui.chkColorIcons->isChecked());
 	theConf->SetValue("Options/UseOverlayIcons", ui.chkOverlayIcons->isChecked());
 	theConf->SetValue("Options/HideSbieProcesses", ui.chkHideCore->isChecked());
+	theConf->SetValue("Options/HighlightPendingChanges", CSettingsWindow__Chk2Int(ui.chkHighlightPendingChanges->checkState()));
 	theConf->SetValue("Options/BoxGroupHandling", ui.cmbGrouping->currentIndex());
 
 	CIniHighlighter::ClearLanguageCache();
@@ -2076,6 +2119,7 @@ void CSettingsWindow::SaveSettings()
 	theConf->SetValue("Options/SysTrayIcon", ui.cmbSysTray->currentIndex());
 	theConf->SetValue("Options/SysTrayFilter", ui.cmbTrayBoxes->currentIndex());
 	theConf->SetValue("Options/CompactTray", ui.chkCompactTray->isChecked());
+	theConf->SetValue("Options/TraySearch", ui.chkTraySearch->isChecked());
 	theConf->SetValue("Options/TrayIcons", ui.chkTrayIcons->isChecked());
 	theConf->SetValue("Options/TrayOverlayIcons", ui.chkTrayOverlayIcons->isChecked());
 	theConf->SetValue("Options/TrayUseAlias", ui.chkTrayUseAlias->isChecked());
@@ -2110,6 +2154,7 @@ void CSettingsWindow::SaveSettings()
 	theConf->SetValue("Options/TraySingleClick", ui.chkSingleShow->isChecked());
 
 	theConf->SetValue("Options/UseW11Style", ui.chkUseW11Style->isChecked());
+	theConf->SetValue("Options/UseRandomBoxName", ui.chkRandomGuidName->isChecked());
 
 	if (theAPI->IsConnected())
 	{
@@ -2165,6 +2210,8 @@ void CSettingsWindow::SaveSettings()
 				WriteAdvancedCheck(ui.chkSbieLogon, "SandboxieLogon", "y", "");
 				WriteAdvancedCheck(ui.chkSbieAll, "SandboxieAllGroup", "", "n");
 				WriteAdvancedCheck(ui.chkSbieUAC, "UseSandboxieUAC", "", "n");
+				WriteText("BoxAliasDisplayMode", ui.cmbBoxAliasDisplayMode->currentData().toInt() == 2
+					? QString() : QString::number(ui.cmbBoxAliasDisplayMode->currentData().toInt()));
 
 				if (m_FeaturesChanged) {
 					m_FeaturesChanged = false;
@@ -2370,6 +2417,14 @@ void CSettingsWindow::OnOptChanged()
 	item = model->item(3);
 	item->setFlags((ui.cmbSysTray->currentIndex() != 0) ? item->flags() & ~Qt::ItemIsEnabled : item->flags() | Qt::ItemIsEnabled);
 
+	if (sender() == ui.chkHighlightPendingChanges) {
+		m_PendingChanges.SetEnabled(CSettingsWindow__IsPendingHighlightEnabled(ui.chkHighlightPendingChanges->checkState()), m_pTree);
+		if (!m_HoldChange)
+			m_PendingChanges.UpdateAll(m_pTree);
+	}
+	else if (!m_HoldChange)
+		m_PendingChanges.Update(sender(), m_pTree);
+
 	if (m_HoldChange)
 		return;
 	ui.buttonBox->button(QDialogButtonBox::Apply)->setEnabled(true);
@@ -2408,6 +2463,7 @@ void CSettingsWindow::OnLoadAddon()
 		connect(pLabel, SIGNAL(linkActivated(const QString&)), theGUI, SLOT(OpenUrl(const QString&)));
 		ui.treeAddons->setItemWidget(pItem, 3, pLabel);
 	}
+	m_PendingChanges.CaptureItemBaselines(m_pTree, ui.treeAddons);
 }
 
 void CSettingsWindow::OnInstallAddon()
@@ -2531,6 +2587,7 @@ void CSettingsWindow::OnCompat()
 	}
 
 	m_CompatLoaded = 1;
+	m_PendingChanges.CaptureItemBaselines(m_pTree, ui.treeCompat);
 	if(bNew)
 		OnCompatChanged();
 
@@ -2800,6 +2857,8 @@ void CSettingsWindow::LoadTemplates()
 		pItem->setText(0, Title);
 		ui.treeTemplates->addTopLevelItem(pItem);
 	}
+
+	m_PendingChanges.CaptureItemBaselines(m_pTree, ui.treeTemplates);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2852,10 +2911,11 @@ void CSettingsWindow::OnIniValidationToggled(int state)
 	}
 
 	// Attach new highlighter to the code editor's document
-	QTextEdit* pTextEdit = m_pCodeEdit->findChild<QTextEdit*>();
+	QTextEdit* pTextEdit = m_pCodeEdit->GetTextEdit();
 	if (pTextEdit) {
 		m_pIniHighlighter = new CIniHighlighter(theGUI->m_DarkTheme, pTextEdit->document(), m_IniValidationEnabled);
 		m_pIniHighlighter->rehighlight();
+		UpdateAutoCompletion();
 	}
 
 	m_HoldChange = false;
@@ -2914,27 +2974,6 @@ void CSettingsWindow::OnAutoCompletionToggled(int state)
 	}
 
 	CCodeEdit::SetAutoCompletionMode(state);
-
-	// Enable or disable the completer based on mode
-	if (m_pCodeEdit) {
-		if (CCodeEdit::GetAutoCompletionMode() != CCodeEdit::AutoCompletionMode::Disabled) {
-			// Create completer if it doesn't exist
-			if (!m_pCodeEdit->GetCompleter()) {
-				QCompleter* completer = new QCompleter(this);
-				completer->setModelSorting(QCompleter::CaseInsensitivelySortedModel);
-				completer->setFilterMode(Qt::MatchContains);
-				m_pCodeEdit->SetCompleter(completer);
-
-				// Update completion model with current settings
-				UpdateAutoCompletion();
-			}
-		}
-		else {
-			// Disable completer
-			m_pCodeEdit->SetCompleter(nullptr);
-			CCodeEdit::ClearFuzzyCache();
-		}
-	}
 
 	m_HoldChange = false;
 }
@@ -3122,6 +3161,8 @@ void CSettingsWindow::InitSupport()
 	connect(ui.lblInsiderInfo, SIGNAL(linkActivated(const QString&)), theGUI, SLOT(OpenUrl(const QString&)));
 
 	m_CertChanged = false;
+	m_PendingChanges.ExcludeValue(ui.txtCertificate);
+	m_PendingChanges.ExcludeValue(ui.txtSerial);
 	connect(ui.txtCertificate, SIGNAL(textChanged()), this, SLOT(CertChanged()));
 	ui.txtCertificate->installEventFilter(this);
 	connect(ui.txtSerial, SIGNAL(textChanged(const QString&)), this, SLOT(KeyChanged()));
@@ -3215,7 +3256,9 @@ void CSettingsWindow::UpdateCert()
 		int datePos = truncatedCert.indexOf("DATE:");
 		if (namePos != -1 && datePos != -1 && datePos > namePos)
 			truncatedCert = truncatedCert.mid(0, namePos + 5) + " ...\n" + truncatedCert.mid(datePos);
+		QSignalBlocker Blocker(ui.txtCertificate);
 		ui.txtCertificate->setPlainText(truncatedCert);
+		ui.txtCertificate->setProperty("modified", false);
 		//ui.lblSupport->setVisible(false);
 
 		QString ReNewUrl = "https://sandboxie-plus.com/go.php?to=sbie-renew-cert";
@@ -3730,7 +3773,8 @@ void CSettingsWindow::OnEditorSettings()
 		// - ValidateIniKeys (ui.chkValidateIniKeys)
 		// - EnableIniTooltips (ui.chkEnableTooltips)
 		// - EnableAutoCompletion (ui.chkEnableAutoCompletion)
-		// The other 3 settings (EnablePopupTooltips, EnableFuzzyMatching, AutoCompletionConsent)
+		// The other 4 settings (EnablePopupTooltips, EnableFuzzyMatching, AutoCompletionConsent,
+		// ShowFutureSettings)
 		// are managed by EditorSettings but don't have corresponding UI in SettingsWindow
 		
 		// Block signals while updating checkboxes to prevent toggle handlers from being called prematurely

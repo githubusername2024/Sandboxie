@@ -263,6 +263,8 @@ MSG_HEADER *ProcessServer::KillAllHandler(MSG_HEADER *msg)
     if (req->h.length < sizeof(PROCESS_KILL_ALL_REQ))
         return SHORT_REPLY(STATUS_INVALID_PARAMETER);
 
+    req->boxname[ARRAYSIZE(req->boxname) - 1] = L'\0';
+
     TargetSessionId = req->session_id;
     wcscpy(TargetBoxName, req->boxname);
     if (! TargetBoxName[0])
@@ -365,7 +367,7 @@ NTSTATUS ProcessServer::KillAllHelper(const WCHAR *BoxName, ULONG SessionId, BOO
             Sleep(100);
         }
 
-        for (i = 0; i <= count; ++i)
+        for (i = 0; i < count; ++i)
             KillProcess(pids[i]);
     }
 
@@ -513,6 +515,8 @@ MSG_HEADER *ProcessServer::RunSandboxedHandler(MSG_HEADER *msg)
     if (req->h.length < sizeof(PROCESS_RUN_SANDBOXED_REQ))
         return SHORT_REPLY(STATUS_INVALID_PARAMETER);
 
+    req->boxname[ARRAYSIZE(req->boxname) - 1] = L'\0';
+
     WCHAR *cmd = RunSandboxedCopyString(&req->h, req->cmd_ofs, req->cmd_len);
     WCHAR *dir = RunSandboxedCopyString(&req->h, req->dir_ofs, req->dir_len);
     WCHAR *env = RunSandboxedCopyString(&req->h, req->env_ofs, req->env_len);
@@ -557,11 +561,11 @@ MSG_HEADER *ProcessServer::RunSandboxedHandler(MSG_HEADER *msg)
                 CallerInSandbox = true;
                 SbieApi_QueryProcess((HANDLE)(ULONG_PTR)CallerPid, boxname, NULL, sid, &session_id);
                 BoxNameOrModelPid = -(LONG_PTR)(LONG)CallerPid;
-                if ((req->si_flags & 0x80000000) != 0) { // bsession0 - this is only allowed for unsandboxed processes
-                    lvl = 0xFF;
-                    err = ERROR_NOT_SUPPORTED;
-                    goto end;
-                }
+                //if ((req->si_flags & 0x80000000) != 0) { // bsession0 - this is only allowed for unsandboxed processes
+                //    lvl = 0xFF;
+                //    err = ERROR_NOT_SUPPORTED;
+                //    goto end;
+                //}
             } else {
                 CallerInSandbox = false;
                 if (*req->boxname == L'-') {
@@ -1004,9 +1008,9 @@ HANDLE ProcessServer::RunSandboxedGetToken(
         // then we want to adjust the DACL in the new token
         //
 
-		if (SbieApi_QueryConfBool(boxname, L"ExposeBoxedSystem", FALSE))
-			ok = RunSandboxedSetDacl(CallerProcessHandle, NewTokenHandle, GENERIC_ALL, TRUE);
-        else if (SbieApi_QueryConfBool(boxname, L"AdjustBoxedSystem", TRUE))
+		//if (SbieApi_QueryConfBool(boxname, L"ExposeBoxedSystem", FALSE))
+		//	ok = RunSandboxedSetDacl(CallerProcessHandle, NewTokenHandle, GENERIC_ALL, TRUE);
+        //else if (SbieApi_QueryConfBool(boxname, L"AdjustBoxedSystem", TRUE))
             // OriginalToken BEGIN
             if(!CompartmentMode && !SbieApi_QueryConfBool(boxname, L"OriginalToken", FALSE))
             // OriginalToken END
@@ -1303,10 +1307,10 @@ BOOL ProcessServer::RunSandboxedStartProcess(
         // similar to running boxed services with "RunServicesAsSystem=y" hence to mitigate potential
         // issues it is recommended to activate "DropAdminRights=y" for boxed using this feature
         // Note: BoxNameOrModelPid > 0 is only true when the caller is not sandboxed
-        bool bSession0 = (BoxNameOrModelPid > 0) && ((si->dwFlags & 0x80000000) != 0);
-        if (bSession0) {
-            OpenProcessToken(GetCurrentProcess(), TOKEN_IMPERSONATE | TOKEN_QUERY | TOKEN_DUPLICATE | STANDARD_RIGHTS_READ, &PrimaryTokenHandle);
-        }
+        //bool bSession0 = (BoxNameOrModelPid > 0) && ((si->dwFlags & 0x80000000) != 0);
+        //if (bSession0) {
+        //    OpenProcessToken(GetCurrentProcess(), TOKEN_IMPERSONATE | TOKEN_QUERY | TOKEN_DUPLICATE | STANDARD_RIGHTS_READ, &PrimaryTokenHandle);
+        //}
 
         // impersonate caller in case they have a different device map
         // with different drive mappings
@@ -1314,10 +1318,10 @@ BOOL ProcessServer::RunSandboxedStartProcess(
                             SecurityImpersonation,
                             &ImpersonationTokenHandle);
 
-        if (bSession0) {
-            CloseHandle(PrimaryTokenHandle);
-            PrimaryTokenHandle = NULL;
-        }
+        //if (bSession0) {
+        //    CloseHandle(PrimaryTokenHandle);
+        //    PrimaryTokenHandle = NULL;
+        //}
 
         if (ok)
             ok = SetThreadToken(NULL, ImpersonationTokenHandle);
@@ -2206,6 +2210,8 @@ MSG_HEADER *ProcessServer::SuspendAllHandler(MSG_HEADER *msg)
     PROCESS_SUSPEND_RESUME_ALL_REQ *req = (PROCESS_SUSPEND_RESUME_ALL_REQ *)msg;
     if (req->h.length < sizeof(PROCESS_SUSPEND_RESUME_ALL_REQ))
         return SHORT_REPLY(STATUS_INVALID_PARAMETER);
+
+    req->boxname[ARRAYSIZE(req->boxname) - 1] = L'\0';
 
     TargetSessionId = req->session_id;
     wcscpy(TargetBoxName, req->boxname);

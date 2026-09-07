@@ -546,7 +546,7 @@ _FX void Dll_InitInjected(void)
 
     Dll_InitComplete = TRUE;
 
-    if (! Dll_RestrictedToken)
+    if (!Dll_RestrictedToken && !Dll_AppContainerToken)
         CustomizeSandbox();
 }
 
@@ -845,6 +845,11 @@ _FX ULONG Dll_GetImageType(const WCHAR *ImageName)
 _FX void Dll_SelectImageType(void)
 {
     Dll_ImageType = Dll_GetImageType(Dll_ImageName);
+
+    if (Dll_ImageType == DLL_IMAGE_GOOGLE_CHROME) {
+        extern BOOLEAN Dll_UseChromeSecurePreferencesHack;
+        Dll_UseChromeSecurePreferencesHack = Config_GetSettingsForImageName_bool(L"UseChromeSecurePreferencesHack", TRUE);
+    }
 
     //if (Dll_ImageType == DLL_IMAGE_UNSPECIFIED &&
     //        _wcsnicmp(Dll_ImageName, L"FlashPlayerPlugin_", 18) == 0)

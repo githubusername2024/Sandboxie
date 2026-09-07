@@ -462,23 +462,19 @@ COptionsWindow::COptionsWindow(const QSharedPointer<CSbieIni>& pBox, const QStri
 		CCodeEdit::SetPopupTooltipsEnabled(popupMode);
 	}
 
-	// Set up autocompletion based on mode
-	QCompleter* completer = new QCompleter(this);
-	completer->setModelSorting(QCompleter::CaseInsensitivelySortedModel);
-	completer->setFilterMode(Qt::MatchContains);
-	
-	// Set completer based on mode
-	if (CCodeEdit::GetAutoCompletionMode() != CCodeEdit::AutoCompletionMode::Disabled) {
-		m_pCodeEdit->SetCompleter(completer);
-	}
-	else {
-		m_pCodeEdit->SetCompleter(nullptr);
-	}
-
 	m_pCodeEdit->SetCompletionFilterCallback([](const QString& keyName, const QString& inputKey) -> bool {
 		return CIniHighlighter::IsKeyHiddenFromPopup(keyName)
 			|| CIniHighlighter::ShouldHideCompletionCandidate(inputKey, keyName, 'p');
-		});
+	});
+	m_pCodeEdit->SetCompletionInsertionCallback([](const QString& candidateKey) -> QString {
+		return CIniHighlighter::GetCompletionInsertionText(candidateKey);
+	});
+	m_pCodeEdit->SetCompletionMatchTextCallback([](const QString& candidateKey) -> QString {
+		return CIniHighlighter::GetCompletionMatchText(candidateKey);
+	});
+	m_pCodeEdit->SetCompletionScoringCallback([](const QStringList& candidates, const QString& inputKey) -> QHash<QString, int> {
+		return CIniHighlighter::GetCompletionScores(candidates, inputKey);
+	});
 	m_pCodeEdit->SetCaseCorrectionCallback([](const QString& wrongKey) -> QString {
 		return CIniHighlighter::FindCaseCorrectedKey(wrongKey);
 		});
@@ -486,14 +482,12 @@ COptionsWindow::COptionsWindow(const QSharedPointer<CSbieIni>& pBox, const QStri
 		return CIniHighlighter::IsKeyHiddenFromContext(keyName, 'c')
 			|| CIniHighlighter::ShouldHideCompletionCandidate(inputKey, keyName, 'c');
 		});
-	m_pCodeEdit->SetPopupTooltipCallback([](const QString& keyName) -> QString {
-		return CIniHighlighter::GetSettingTooltipForPopup(keyName);
+	const char currentContext = m_Template ? 't' : 's';
+	m_pCodeEdit->SetPopupTooltipCallback([currentContext](const QString& keyName) -> QString {
+		return CIniHighlighter::GetSettingTooltipForPopup(keyName, QString(), currentContext);
 		});
-	
-	// Update completion model with current settings if auto completion is enabled
-	if (CCodeEdit::GetAutoCompletionMode() != CCodeEdit::AutoCompletionMode::Disabled) {
-		UpdateAutoCompletion();
-	}
+	connect(m_pCodeEdit, SIGNAL(autoCompletionModeChanged(int)), this, SLOT(OnAutoCompletionModeChanged(int)));
+	ApplyAutoCompletionMode(static_cast<int>(CCodeEdit::GetAutoCompletionMode()));
 
 	CreateDebug();
 
@@ -626,6 +620,7 @@ COptionsWindow::COptionsWindow(const QSharedPointer<CSbieIni>& pBox, const QStri
 
 	// Recovery
 	connect(ui.chkAutoRecovery, SIGNAL(clicked(bool)), this, SLOT(OnRecoveryChanged()));
+	connect(ui.chkUseIgnoreForQuick, SIGNAL(clicked(bool)), this, SLOT(OnRecoveryChanged()));
 	connect(ui.btnAddRecovery, SIGNAL(clicked(bool)), this, SLOT(OnAddRecFolder()));
 	connect(ui.btnDelRecovery, SIGNAL(clicked(bool)), this, SLOT(OnDelRecEntry()));
 	connect(ui.btnAddRecIgnore, SIGNAL(clicked(bool)), this, SLOT(OnAddRecIgnore()));
@@ -797,6 +792,31 @@ void COptionsWindow::UpdateAutoCompletion()
 	m_pCodeEdit->UpdateCompletionModel(candidates);
 }
 
+void COptionsWindow::ApplyAutoCompletionMode(int state)
+{
+	if (!m_pCodeEdit)
+		return;
+
+	if (!m_pCodeEdit->GetCompleter()) {
+		QCompleter* completer = new QCompleter(m_pCodeEdit);
+		completer->setModelSorting(QCompleter::CaseInsensitivelySortedModel);
+		completer->setFilterMode(Qt::MatchContains);
+		m_pCodeEdit->SetCompleter(completer);
+	}
+
+	if (state == Qt::Unchecked) {
+		m_pCodeEdit->HideCompletionPopup();
+		return;
+	}
+
+	UpdateAutoCompletion();
+}
+
+void COptionsWindow::OnAutoCompletionModeChanged(int state)
+{
+	ApplyAutoCompletionMode(state);
+}
+
 void COptionsWindow::OnSetTree()
 {
 	if (!ui.tabs) return;
@@ -810,6 +830,7 @@ void COptionsWindow::OnOptChanged()
 {
 	if (m_HoldChange)
 		return;
+	m_PendingChanges.Update(sender(), m_pTree);
 	ui.buttonBox->button(QDialogButtonBox::Apply)->setEnabled(true);
 }
 
@@ -947,11 +968,12 @@ bool COptionsWindow::eventFilter(QObject *source, QEvent *event)
 		// Check if tooltips are completely disabled
 		if (CIniHighlighter::GetTooltipMode() == CIniHighlighter::TooltipMode::Disabled)
 			return false;
+		const char currentContext = m_Template ? 't' : 's';
 
 		QHelpEvent* helpEvent = static_cast<QHelpEvent*>(event);
 
 		// Find the text edit widget inside CCodeEdit
-		QTextEdit* pTextEdit = m_pCodeEdit->findChild<QTextEdit*>();
+		QTextEdit* pTextEdit = m_pCodeEdit->GetTextEdit();
 		if (pTextEdit) {
 			// Convert mouse position to text cursor position
 			QPoint pos = pTextEdit->viewport()->mapFrom(m_pCodeEdit, helpEvent->pos());
@@ -964,14 +986,6 @@ bool COptionsWindow::eventFilter(QObject *source, QEvent *event)
 			// Don't show tooltips for comment lines
 			if (CIniHighlighter::IsCommentLine(currentLine))
 				return false;
-
-			// Check if we're on the value side of the equals sign (after the =)
-			int equalsPos = currentLine.indexOf('=');
-			if (equalsPos >= 0 && (cursor.position() - block.position()) > equalsPos) {
-				// We're in the value part, don't show tooltip
-				QToolTip::hideText();
-				return false;
-			}
 
 			// Custom word selection that includes dots and underscores
 			int initialPos = cursor.position() - block.position();
@@ -1003,7 +1017,9 @@ bool COptionsWindow::eventFilter(QObject *source, QEvent *event)
 					QString settingName = currentLine.mid(startPos, endPos - startPos);
 					if (settingName.endsWith('='))
 						settingName.chop(1);
-					QString tooltipText = CIniHighlighter::GetSettingTooltip(settingName);
+					const int equalsIndex = currentLine.indexOf('=');
+					const QString settingValue = equalsIndex >= 0 ? currentLine.mid(equalsIndex + 1).trimmed() : QString();
+					QString tooltipText = CIniHighlighter::GetSettingTooltip(settingName, settingValue, currentContext);
 					if (!tooltipText.isEmpty()) {
 						QToolTip::showText(helpEvent->globalPos(), tooltipText, pTextEdit);
 						return true;
@@ -1078,8 +1094,13 @@ void COptionsWindow::WriteGlobalCheck(QCheckBox* pCheck, const QString& Setting,
 void COptionsWindow::LoadConfig()
 {
 	m_ConfigDirty = false;
+	m_StartRadioBaselineLoaded = false;
 
 	m_HoldChange = true;
+	int iHighlightPendingChanges = theConf->GetInt("Options/HighlightPendingChanges", 2);
+	if (iHighlightPendingChanges == 2)
+		iHighlightPendingChanges = theConf->GetInt("Options/ViewMode", 1) != 2 ? 1 : 0;
+	m_PendingChanges.SetEnabled(iHighlightPendingChanges != 0, m_pTree);
 
 	LoadTemplates();
 
@@ -1110,6 +1131,10 @@ void COptionsWindow::LoadConfig()
 
 	// Update autocompletion after all settings are loaded
 	UpdateAutoCompletion();
+	m_PendingChanges.CaptureItemBaselines(m_pTree);
+	m_PendingChanges.CaptureCheckboxBaselines();
+	m_PendingChanges.CaptureRadioButtonBaselines();
+	m_PendingChanges.CaptureValueBaselines();
 
 	m_HoldChange = false;
 }
@@ -1282,6 +1307,7 @@ bool COptionsWindow::apply()
 	CloseNetFwEdit();
 	CloseAccessEdit();
 	CloseOptionEdit();
+	CloseCopyEdit();
     CloseNetProxyEdit();
 
 	if (!ui.btnEditIni->isEnabled())
@@ -1452,6 +1478,13 @@ void COptionsWindow::UpdateCurrentTab()
 		CopyGroupToList("<StartRunAccessDisabled>", ui.treeStart, true);
 
 		OnRestrictStart();
+		m_PendingChanges.CaptureItemBaselines(m_pTree, ui.treeStart);
+		if (!m_StartRadioBaselineLoaded) {
+			m_PendingChanges.CaptureRadioButtonBaseline(ui.radStartAll);
+			m_PendingChanges.CaptureRadioButtonBaseline(ui.radStartExcept);
+			m_PendingChanges.CaptureRadioButtonBaseline(ui.radStartSelected);
+			m_StartRadioBaselineLoaded = true;
+		}
 	}
 	else if (m_pCurrentTab == ui.tabInternet || m_pCurrentTab == ui.tabINet || m_pCurrentTab == ui.tabNetConfig)
 	{
@@ -1529,10 +1562,11 @@ void COptionsWindow::OnIniValidationToggled(int state)
 		m_pIniHighlighter = nullptr;
 	}
 
-	QTextEdit* pTextEdit = m_pCodeEdit->findChild<QTextEdit*>();
+	QTextEdit* pTextEdit = m_pCodeEdit->GetTextEdit();
 	if (pTextEdit) {
 		m_pIniHighlighter = new CIniHighlighter(theGUI->m_DarkTheme, pTextEdit->document(), m_IniValidationEnabled);
 		m_pIniHighlighter->rehighlight();
+		UpdateAutoCompletion();
 	}
 
 	m_HoldChange = false;
@@ -1592,27 +1626,6 @@ void COptionsWindow::OnAutoCompletionToggled(int state)
 
 	CCodeEdit::SetAutoCompletionMode(state); // Use static method like tooltip
 
-	// Enable or disable the completer based on mode
-	if (m_pCodeEdit) {
-		if (CCodeEdit::GetAutoCompletionMode() != CCodeEdit::AutoCompletionMode::Disabled) {
-			// Create completer if it doesn't exist
-			if (!m_pCodeEdit->GetCompleter()) {
-				QCompleter* completer = new QCompleter(this);
-				completer->setModelSorting(QCompleter::CaseInsensitivelySortedModel);
-				completer->setFilterMode(Qt::MatchContains);
-				m_pCodeEdit->SetCompleter(completer);
-
-				// Update completion model with current settings
-				UpdateAutoCompletion();
-			}
-		}
-		else {
-			// Disable completer
-			m_pCodeEdit->SetCompleter(nullptr);
-			CCodeEdit::ClearFuzzyCache();
-		}
-	}
-
 	m_HoldChange = false;
 }
 
@@ -1638,7 +1651,8 @@ void COptionsWindow::OnEditorSettings()
 		// - ValidateIniKeys (ui.chkValidateIniKeys)
 		// - EnableIniTooltips (ui.chkEnableTooltips)
 		// - EnableAutoCompletion (ui.chkEnableAutoCompletion)
-		// The other 3 settings (EnablePopupTooltips, EnableFuzzyMatching, AutoCompletionConsent)
+		// The other 4 settings (EnablePopupTooltips, EnableFuzzyMatching, AutoCompletionConsent,
+		// ShowFutureSettings)
 		// are managed by EditorSettings but don't have corresponding UI in OptionsWindow
 		
 		// Block signals while updating checkboxes to prevent toggle handlers from being called prematurely
